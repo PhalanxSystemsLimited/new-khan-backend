@@ -1,0 +1,155 @@
+import { Router } from 'express';
+import { z } from 'zod';
+import { supabaseAdmin, supabasePublic } from '../../config/supabase.js';
+import { env } from '../../config/env.js';
+import { one } from '../../config/db.js';
+import { validate } from '../../middleware/validate.js';
+import { requireAuth } from '../../middleware/auth.js';
+import { authLimiter, otpLimiter } from '../../middleware/rateLimit.js';
+import { AppError } from '../../utils/AppError.js';
+import { cnic, email, password, personName, phone } from '../../utils/schemas.js';
+import { cnicDisplay } from '../../utils/cnic.js';
+
+const router = Router();
+
+const sessionPayload = (session, user) => ({
+  accessToken: session?.access_token,
+  refreshToken: session?.refresh_token,
+  expiresAt: session?.expires_at,
+  tokenType: 'bearer',
+  user: user ? { id: user.id, email: user.email, phone: user.phone } : undefined,
+});
+
+// Generic messages: never reveal whether an account exists.
+const INVALID_LOGIN = 'Invalid email or password';
+
+const signupSchema = z
+  .object({
+    fullName: personName,
+    email,
+    password,
+    phone: phone.optional(),
+    // The account holder's CNIC: every booking made with this account carries it (checked for counter refunds).
+    cnic,
+  })
+  .strict();
+
+router.post('/signup', authLimiter, validate({ body: signupSchema }), async (req, res) => {
+  const { fullName, email: mail, password: pwd, phone: tel, cnic: id } = req.valid.body;
+  const { data, error } = await supabasePublic().auth.signUp({
+    email: mail,
+    password: pwd,
+    options: {
+      data: { full_name: fullName },
+      emailRedirectTo: env.AUTH_REDIRECT_URL,
+    },
+  });
+  if (error) {
+    req.log.info({ code: error.code }, 'signup failed');
+    throw AppError.badRequest('Unable to create account. The email may already be registered or the password is too weak.');
+  }
+
+  if (data.user) {
+    // The profile row is created by the auth trigger. Phone is stored unverified, for booking contact purposes.
+    if (tel) await one(`UPDATE users SET phone = $2 WHERE id = $1 AND phone IS NULL`, [data.user.id, tel]).catch(() => {});
+    await one(`UPDATE users SET cnic = $2 WHERE id = $1 AND cnic IS NULL`, [data.user.id, cnicDisplay(id)]).catch(() => {});
+  }
+
+  res.status(201).json({
+    message: data.session
+      ? 'Account created.'
+      : 'Account created. Please check your email to confirm your address.',
+    ...(data.session ? sessionPayload(data.session, data.user) : {}),
+  });
+});
+
+router.post(
+  '/login',
+  authLimiter,
+  validate({ body: z.object({ email, password: z.string().min(1).max(72) }).strict() }),
+  async (req, res) => {
+    const { data, error } = await supabasePublic().auth.signInWithPassword(req.valid.body);
+    if (error || !data.session) throw AppError.unauthorized(INVALID_LOGIN);
+    res.json(sessionPayload(data.session, data.user));
+  },
+);
+
+// ---- Phone OTP login (requires an SMS provider configured in Supabase Auth) ----
+router.post(
+  '/otp/send',
+  otpLimiter,
+  validate({ body: z.object({ phone }).strict() }),
+  async (req, res) => {
+    const { error } = await supabasePublic().auth.signInWithOtp({ phone: req.valid.body.phone });
+    if (error) req.log.warn({ code: error.code }, 'OTP send failed');
+    // Same response either way to avoid leaking information.
+    res.json({ message: 'If the number is valid, a verification code has been sent.' });
+  },
+);
+
+router.post(
+  '/otp/verify',
+  authLimiter,
+  validate({ body: z.object({ phone, token: z.string().regex(/^\d{6}$/, 'Code must be 6 digits') }).strict() }),
+  async (req, res) => {
+    const { data, error } = await supabasePublic().auth.verifyOtp({
+      phone: req.valid.body.phone,
+      token: req.valid.body.token,
+      type: 'sms',
+    });
+    if (error || !data.session) throw AppError.unauthorized('Invalid or expired code');
+    res.json(sessionPayload(data.session, data.user));
+  },
+);
+
+router.post(
+  '/refresh',
+  authLimiter,
+  validate({ body: z.object({ refreshToken: z.string().min(10).max(512) }).strict() }),
+  async (req, res) => {
+    const { data, error } = await supabasePublic().auth.refreshSession({
+      refresh_token: req.valid.body.refreshToken,
+    });
+    if (error || !data.session) throw AppError.unauthorized('Session expired, please log in again');
+    res.json(sessionPayload(data.session, data.user));
+  },
+);
+
+router.post('/logout', requireAuth, async (req, res) => {
+  // Revokes all refresh tokens for this session.
+  const { error } = await supabaseAdmin.auth.admin.signOut(req.accessToken, 'global');
+  if (error) req.log.warn({ code: error.code }, 'logout failed');
+  res.json({ message: 'Logged out' });
+});
+
+router.post(
+  '/password/forgot',
+  otpLimiter,
+  validate({ body: z.object({ email }).strict() }),
+  async (req, res) => {
+    const { error } = await supabasePublic().auth.resetPasswordForEmail(req.valid.body.email, {
+      redirectTo: env.AUTH_REDIRECT_URL,
+    });
+    if (error) req.log.warn({ code: error.code }, 'password reset email failed');
+    res.json({ message: 'If an account exists for this email, a reset link has been sent.' });
+  },
+);
+
+/** Set a new password. Works for a logged-in user or the recovery session from the reset email. */
+router.post(
+  '/password/reset',
+  authLimiter,
+  requireAuth,
+  validate({ body: z.object({ password }).strict() }),
+  async (req, res) => {
+    const { error } = await supabaseAdmin.auth.admin.updateUserById(req.user.id, {
+      password: req.valid.body.password,
+    });
+    if (error) throw AppError.badRequest('Unable to update password');
+    // Invalidate other sessions after a password change.
+    await supabaseAdmin.auth.admin.signOut(req.accessToken, 'others').catch(() => {});
+    res.json({ message: 'Password updated' });
+  },
+);
+
+export default router;
