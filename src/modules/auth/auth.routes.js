@@ -45,7 +45,15 @@ router.post('/signup', authLimiter, validate({ body: signupSchema }), async (req
     },
   });
   if (error) {
-    req.log.info({ code: error.code }, 'signup failed');
+    req.log.info({ code: error.code, status: error.status }, 'signup failed');
+    // Say why, where it is safe to: Supabase's email limit and weak passwords are not secrets.
+    if (error.code === 'over_email_send_rate_limit' || error.status === 429) {
+      throw new AppError(429, 'Too many accounts were created in the last hour. Please try again later, or sign in with a phone code.', 'TOO_MANY_SIGNUPS');
+    }
+    if (error.code === 'weak_password') {
+      throw AppError.badRequest('That password is too weak. Use at least 8 characters with upper-case, lower-case and a number.');
+    }
+    if (error.code === 'email_address_invalid') throw AppError.badRequest('That email address cannot be used. Please check it.');
     throw AppError.badRequest('Unable to create account. The email may already be registered or the password is too weak.');
   }
 
