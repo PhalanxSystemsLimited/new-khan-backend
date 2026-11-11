@@ -23,6 +23,14 @@ import bookingRoutes, { ticketsRouter } from './modules/bookings/bookings.routes
 import paymentRoutes, { paymentWebhook, safepayReturn } from './modules/payments/payments.routes.js';
 import adminRoutes from './modules/admin/admin.routes.js';
 import { adminContentRouter, publicContentRouter } from './modules/content/content.routes.js';
+import {
+  adminRoundTripsRouter, adminVouchersRouter, publicReportRouter, reportSettingsRouter,
+} from './modules/roundtrips/roundtrips.routes.js';
+import tripVoucherRoutes from './modules/tripvouchers/tripVouchers.routes.js';
+import conductorRoutes from './modules/conductor/conductor.routes.js';
+import { adminEmployeesRouter, crewRouter } from './modules/employees/employees.routes.js';
+import { dayPlanRouter } from './modules/dayplan/dayPlan.routes.js';
+import { homeRouter } from './modules/home/home.routes.js';
 
 export function createApp() {
   const app = express();
@@ -122,6 +130,16 @@ export function createApp() {
   api.use('/payments', paymentRoutes);
   api.use('/content', publicContentRouter);
   api.use('/admin/content', adminContentRouter);
+  api.use('/admin/round-trips', adminRoundTripsRouter);
+  api.use('/admin/vouchers', adminVouchersRouter);
+  api.use('/admin/report-settings', reportSettingsRouter);
+  api.use('/reports', publicReportRouter);
+  api.use('/trip-vouchers', tripVoucherRoutes);
+  api.use('/conductor', conductorRoutes);
+  api.use('/admin/employees', adminEmployeesRouter);
+  api.use('/admin/day-plan', dayPlanRouter);
+  api.use('/', homeRouter); // /counter/departures, /me/trips, /board
+  api.use('/employees', crewRouter);
   api.use('/admin', adminRoutes);
   app.use('/api/v1', api);
 

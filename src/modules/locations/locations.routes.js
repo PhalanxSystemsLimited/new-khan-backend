@@ -75,6 +75,7 @@ const terminalSchema = z
     latitude: z.number().min(-90).max(90).optional(),
     longitude: z.number().min(-180).max(180).optional(),
     isActive: z.boolean().optional(),
+    isOrigin: z.boolean().optional(), // Lahore, Multan: where a bus's round trip starts and ends
   })
   .strict();
 
@@ -87,6 +88,7 @@ const TERMINAL_COLS = {
   latitude: 'latitude',
   longitude: 'longitude',
   isActive: 'is_active',
+  isOrigin: 'is_origin',
 };
 
 router.post('/terminals', ...admin, validate({ body: terminalSchema }), async (req, res) => {
@@ -96,6 +98,7 @@ router.post('/terminals', ...admin, validate({ body: terminalSchema }), async (r
      VALUES ($1, $2, $3, $4, $5, $6, $7, COALESCE($8, TRUE)) RETURNING *`,
     [b.cityId, b.name, b.code, b.address ?? null, b.phone ?? null, b.latitude ?? null, b.longitude ?? null, b.isActive ?? null],
   );
+  if (b.isOrigin !== undefined) Object.assign(t, await one(`UPDATE terminals SET is_origin = $2 WHERE id = $1 RETURNING is_origin`, [t.id, b.isOrigin]));
   res.status(201).json({ data: t });
 });
 

@@ -27,6 +27,9 @@ const schema = z.object({
   AUTH_REDIRECT_URL: z.string().url().optional(),
 
   BOOKING_HOLD_MINUTES: z.coerce.number().int().min(2).max(60).default(20),
+  // Online booking from a terminal closes this many minutes before the bus is due there (every terminal, delays
+  // included). Counter staff keep selling until that terminal's voucher is generated.
+  ONLINE_CUTOFF_MINUTES: z.coerce.number().int().min(0).max(720).default(60),
   MAX_SEATS_PER_BOOKING: z.coerce.number().int().min(1).max(20).default(6),
 
   // Only for the generic relay webhook (non-Safepay methods). Leave unset to disable that webhook.
@@ -38,6 +41,9 @@ const schema = z.object({
   // Public URLs used to build payment return/cancel links.
   APP_URL: z.string().url().optional(), // the frontend, e.g. https://newkhan.com
   API_PUBLIC_URL: z.string().url().optional(), // this API as the internet sees it, e.g. https://api.newkhan.com
+
+  // Round Trip Report page opened by a voucher QR: false = staff must sign in (default), true = anyone with the link.
+  PUBLIC_TRIP_REPORT: bool.default('false'),
 
   // ---- Safepay (enabled when SAFEPAY_API_KEY is set) ----
   SAFEPAY_ENV: z.enum(['sandbox', 'production']).default('sandbox'),

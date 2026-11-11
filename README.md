@@ -256,13 +256,26 @@ expired reservation (last 7 days) and then calls `POST /bookings/expiry-seen`, w
 | Role | Can |
 |---|---|
 | `customer` | Book online, see/cancel own bookings |
-| `agent` | Staff: counter sales (cash), search bookings, manifests, boarding, trip status |
-| `admin` | Everything an agent can + manage routes, fares, fleet, schedules, promo codes, refunds, reports |
-| `super_admin` | Everything + manage admin accounts |
+| `agent` (**Counter staff**) | Tied to one terminal (`users.terminal_id`). Counter sales (cash), bookings, manifests, boarding, vouchers; generates the terminal voucher of **their own terminal** only |
+| `conductor` | Only the conductor screen of trips they are the conductor (or stand-in) of: live seats and passengers, road passengers, no-shows |
+| `manager` | Everything counter staff can, at any terminal + trip status, bus and crew, replacement vouchers, reading refunds and reports |
+| `admin` | Everything + routes, fares, fleet, conductors, schedules, settings, deductions, promo codes, users (counter staff and conductors) |
+| `super_admin` | Everything + giving manager and admin roles |
 
 Roles are stored in `public.users.role` (never trusted from the token). Staff work in the **admin panel** of the website
-(`/admin`, see the frontend README), which calls the endpoints below. To make someone staff: they sign up on the website, then a
-super admin changes their role under *Users & staff*. The very first super admin is set in SQL (§2.1 step 4).
+(`/admin`), which calls the endpoints below. To make someone staff: they sign up on the website, then an admin changes their role
+under *Users & staff* (counter staff also need a terminal). A conductor's login is then linked on *Fleet & people → Conductors*.
+The very first super admin is set in SQL (§2.1 step 4). People who work but do not sign in (cleaners, loaders…) are listed in the
+*Staff directory*.
+
+**Terminal vouchers** (`src/modules/tripvouchers/`, migration `2026-11-10-terminal-vouchers-conductors.sql`): at each terminal the
+counter staff press *Generate voucher*. It gets a 10-digit number from the same series as the report vouchers, is frozen, lists the
+paid passengers boarding there by destination, how many are on the bus after the terminal, terminal cash (paid in cash at the
+counter), online paid, load, cargo and the terminal's fixed deductions (*Terminal deductions*), and the cash handed to the conductor.
+Generating it closes booking from that terminal (search and counter). A trip cannot board, depart or generate vouchers without a
+conductor. A replacement voucher (bus swap) needs a manager or admin and a reason; cancelling a trip voids its vouchers. The conductor
+opens the trip by voucher number at `/admin/conductor` and books road passengers (channel `on_road`, fare typed in or free), which
+blocks those seats for every later terminal.
 
 ### 6.6 Website content
 
@@ -272,6 +285,30 @@ the frontend, and admins can override any section from the admin panel. Override
 A section without a row shows the built-in text. Sections: `company`, `terminals`, `destinations`, `multanLinks`, `busTypes`,
 `promises`, `faq`, `heritage`, `team`, `cargoNote`, `legal`. Saves are checked (shape, size, no `javascript:` links) and logged
 in the audit log.
+
+### 6.7 Round Trip Reports
+
+The income and expense sheet for one bus round trip (admin and super admin only; screens under **Admin → Round trip reports**).
+Code: `src/modules/roundtrips/` (`report.calc.js` holds every formula; `roundtrips.service.js` the data rules). Tables come from
+`db/migrations/2026-11-07-round-trip-reports.sql`.
+
+- **Structure:** a round trip has legs; each leg has one **terminal voucher** per terminal (one row of the sales table: passengers,
+  income, load/cargo, its own on-route expenses and online sales per platform).
+- **Voucher numbers:** 10 digits, made by the database (`next_voucher_no()` locks a counter row per insert, plus a unique
+  constraint), so parallel requests never get the same number and there are no gaps. A deleted voucher's number is not reused.
+- **Diesel:** fuel entries typed in by an admin (station, litres, rate, amount). A blank amount is saved as round(litres × rate).
+- **Off-route expenses:** categories and default amounts in *Off-route expenses* (global default, optional per-route amount or
+  "off on this route", optional bus-class / hostess-bus limits). They are **copied** onto a report when it is created; later
+  changes to the defaults never touch existing reports. Drafts can "Apply new defaults" (lines changed by hand are kept unless
+  ticked). Per-report amount changes are admin-only and marked.
+- **Finalize:** a finalized report cannot be changed (the API answers 409 `FINALIZED`).
+- **QR codes:** every voucher (and the report header) has a 128-bit random token; the QR opens `APP_URL/r/<token>`, which loads
+  `GET /reports/r/:token` fresh on every visit (`Cache-Control: no-store`) and highlights the scanned voucher. Staff must sign in
+  unless `PUBLIC_TRIP_REPORT=true`. "New QR" revokes the old token (it then returns 404). Scans are logged (`report_scans`).
+- **Printing:** the report page's *Download PDF* uses the browser's print dialog (choose "Save as PDF"); voucher slips print at
+  80 mm or 58 mm from *Slip*.
+- **Formulas:** A = Σ total sale; B = other income; X = Σ load + cargo; C = A + B + X; D = diesel + on route + off route;
+  E = other expense; F = D + E; profit = (A−D) | (B−E) | (C−F); G = Σ online sales; cash deposit = C − F − G.
 
 ---
 
@@ -447,4 +484,5 @@ Quote the `requestId` (also in the `X-Request-Id` response header) when searchin
 | Paid booking shows "Held" for a minute | Webhook couldn't reach the server (e.g. localhost). The reconcile step confirms it on next load / within a minute. |
 | Safepay "PAYER_AUTH_ENROLLMENT failed" | Not a Safepay sandbox test card; see §7.4. |
 | `TOO_MANY_PENDING` | Customer has 3 unpaid bookings; pay or cancel one. |
+| `DB_MIGRATION_MISSING` (503) | The code is newer than the database: run the newest files in `db/migrations/` (the log shows the missing table or column). |
 | Changes not taking effect | Restart the process (`pm2 restart new-khan-api`). `.env` is only read at startup. |

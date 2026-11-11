@@ -13,7 +13,13 @@ import { getRouteWithStops } from '../routes/routes.routes.js';
 import { markPaymentRefunded } from '../bookings/bookings.service.js';
 
 const router = Router();
-router.use(requireAuth, requireRole(...ADMIN_ROLES));
+/** Admins: everything here. Managers: only reading refunds and reports. */
+const MANAGER_READABLE = [/^\/refunds\/?$/, /^\/reports\//];
+router.use(requireAuth, (req, _res, next) => {
+  if (ADMIN_ROLES.includes(req.user.role)) return next();
+  if (req.user.role === 'manager' && req.method === 'GET' && MANAGER_READABLE.some((r) => r.test(req.path))) return next();
+  throw AppError.forbidden();
+});
 
 // ======================= Lists for the admin panel (include inactive rows) =======================
 router.get('/routes', async (_req, res) => {
@@ -38,7 +44,7 @@ router.get('/routes/:id', validate({ params: idParam }), async (req, res) => {
 router.get('/locations', async (_req, res) => {
   const cities = await query(`SELECT id, name, province, country, is_active FROM cities ORDER BY name`);
   const terminals = await query(
-    `SELECT t.id, t.city_id, c.name AS city_name, t.name, t.code, t.address, t.phone, t.latitude, t.longitude, t.is_active
+    `SELECT t.id, t.city_id, c.name AS city_name, t.name, t.code, t.address, t.phone, t.latitude, t.longitude, t.is_active, t.is_origin
      FROM terminals t JOIN cities c ON c.id = t.city_id ORDER BY c.name, t.name`,
   );
   res.json({ data: { cities: cities.rows, terminals: terminals.rows } });

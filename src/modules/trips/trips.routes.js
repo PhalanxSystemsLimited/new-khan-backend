@@ -2,7 +2,9 @@ import { Router } from 'express';
 import { z } from 'zod';
 import { query, one, withTransaction } from '../../config/db.js';
 import { validate } from '../../middleware/validate.js';
-import { requireAuth, requireRole, ADMIN_ROLES, STAFF_ROLES } from '../../middleware/auth.js';
+import { optionalAuth, requireAuth, requireRole, isStaff, ADMIN_ROLES, MANAGER_ROLES, STAFF_ROLES } from '../../middleware/auth.js';
+import { env } from '../../config/env.js';
+import { autoCreateReport, closePreviousRoundTrip } from '../roundtrips/roundtrips.sync.js';
 import { searchLimiter } from '../../middleware/rateLimit.js';
 import { AppError } from '../../utils/AppError.js';
 import { audit } from '../../utils/audit.js';
@@ -11,6 +13,7 @@ import { bigIdParam, busClass, intId, isoDate, isoDateTime, longText, personName
 const router = Router();
 const admin = [requireAuth, requireRole(...ADMIN_ROLES)];
 const staff = [requireAuth, requireRole(...STAFF_ROLES)];
+const manager = [requireAuth, requireRole(...MANAGER_ROLES)];
 
 const ACTIVE_TICKET = `('held','reserved','confirmed','boarded')`;
 
@@ -29,17 +32,24 @@ const searchSchema = z
 /**
  * Finds trips that pass through a terminal in fromCity and later a terminal in toCity,
  * departing from the boarding stop on the given date (Pakistan time).
+ *
+ * Every terminal is bookable on its own, so a bus that has left Lahore can still be booked from Sargodha:
+ *  - online: until ONLINE_CUTOFF_MINUTES (1 hour) before the bus is due at that terminal, delays included;
+ *  - counter staff (signed in): until that terminal's voucher is generated.
+ * Seats taken anywhere on the trip (online, counter, road passengers) are taken for every terminal.
  */
-router.get('/search', searchLimiter, validate({ query: searchSchema }), async (req, res) => {
+router.get('/search', searchLimiter, optionalAuth, validate({ query: searchSchema }), async (req, res) => {
   const q = req.valid.query;
+  const staffView = isStaff(req.user);
   const { rows } = await query(
     `SELECT t.id AS trip_id, r.code AS route_code, r.name AS route_name, b.bus_class, b.amenities,
             bs.id AS boarding_stop_id, bt.name AS boarding_terminal,
             ds.id AS dropping_stop_id, dt.name AS dropping_terminal,
-            t.departure_at + make_interval(mins => bs.minutes_from_origin) AS boarding_at,
-            t.departure_at + make_interval(mins => ds.minutes_from_origin) AS dropping_at,
+            t.departure_at + make_interval(mins => bs.minutes_from_origin + t.delay_minutes) AS boarding_at,
+            t.departure_at + make_interval(mins => ds.minutes_from_origin + t.delay_minutes) AS dropping_at,
             t.status, t.delay_minutes, f.amount AS fare, f.currency,
-            seats.bookable - seats.taken AS seats_available
+            seats.bookable - seats.taken AS seats_available,
+            lv.terminal_name AS last_left, lv.generated_at AS last_left_at
      FROM trips t
      JOIN routes r       ON r.id = t.route_id AND r.is_active
      JOIN buses b        ON b.id = t.bus_id
@@ -57,18 +67,28 @@ router.get('/search', searchLimiter, validate({ query: searchSchema }), async (r
         SELECT (SELECT count(*) FROM layout_seats ls WHERE ls.layout_id = b.layout_id AND ls.is_bookable)::int AS bookable,
                (SELECT count(*) FROM tickets tk WHERE tk.trip_id = t.id AND tk.status IN ${ACTIVE_TICKET})::int AS taken
      ) seats
-     WHERE t.status IN ('scheduled', 'delayed')
+     -- Where the bus is: the last terminal that generated its voucher ("on route").
+     LEFT JOIN LATERAL (
+        SELECT tv.terminal_name, tv.generated_at FROM trip_vouchers tv
+        WHERE tv.trip_id = t.id AND tv.status = 'generated' ORDER BY tv.generated_at DESC LIMIT 1
+     ) lv ON TRUE
+     WHERE t.status IN ('scheduled', 'delayed', 'boarding', 'departed')
        AND t.booking_open
-       AND (t.booking_closes_at IS NULL OR t.booking_closes_at > now())
-       AND t.departure_at > now()
+       -- Online: closes ONLINE_CUTOFF_MINUTES before the bus is due at this terminal. Counter staff: until the
+       -- voucher (checked below); 12 hours after the due time it drops off as a forgotten departure.
+       AND t.departure_at + make_interval(mins => bs.minutes_from_origin + t.delay_minutes)
+           > CASE WHEN $6 THEN now() - interval '12 hours' ELSE now() + make_interval(mins => $7) END
        AND t.departure_at >= ($3::date::timestamp AT TIME ZONE 'Asia/Karachi') - interval '1 day'
        AND t.departure_at <  ($3::date::timestamp AT TIME ZONE 'Asia/Karachi') + interval '1 day'
        AND ((t.departure_at + make_interval(mins => bs.minutes_from_origin)) AT TIME ZONE 'Asia/Karachi')::date = $3::date
        AND ($4::bus_class IS NULL OR b.bus_class = $4)
        AND f.amount IS NOT NULL
        AND seats.bookable - seats.taken >= $5
+       -- Booking from a terminal closes when its voucher is generated.
+       AND NOT EXISTS (SELECT 1 FROM trip_vouchers tv
+                       WHERE tv.trip_id = t.id AND tv.boarding_stop_id = bs.id AND tv.status IN ('generated', 'replaced'))
      ORDER BY boarding_at`,
-    [q.fromCityId, q.toCityId, q.date, q.busClass ?? null, q.passengers],
+    [q.fromCityId, q.toCityId, q.date, q.busClass ?? null, q.passengers, staffView, env.ONLINE_CUTOFF_MINUTES],
   );
   res.json({ data: rows });
 });
@@ -114,9 +134,11 @@ const tripCreateSchema = z
     busId: intId,
     driverId: intId.optional(),
     coDriverId: intId.optional(),
+    conductorId: intId.optional(),
     hostessName: personName.optional(),
     departureAt: isoDateTime,
-    bookingCloseMinutes: z.number().int().min(0).max(720).default(30),
+    // Kept for older clients; online booking now closes ONLINE_CUTOFF_MINUTES before the bus reaches each terminal.
+    bookingCloseMinutes: z.number().int().min(0).max(720).default(60),
   })
   .strict()
   .refine((t) => !t.coDriverId || t.coDriverId !== t.driverId, 'Driver and co-driver must differ');
@@ -142,6 +164,19 @@ async function assertDriversValid(client, ids) {
   }
 }
 
+async function assertConductorValid(client, id) {
+  if (!id) return;
+  const c = await one(`SELECT is_active FROM conductors WHERE id = $1`, [id], client);
+  if (!c) throw AppError.badRequest('Conductor not found');
+  if (!c.isActive) throw AppError.unprocessable('That conductor is inactive');
+}
+
+async function assertStandInValid(client, userId) {
+  if (!userId) return;
+  const u = await one(`SELECT role::text, is_active FROM users WHERE id = $1`, [userId], client);
+  if (!u || !u.isActive || u.role === 'customer') throw AppError.badRequest('The stand-in conductor must be an active staff member');
+}
+
 router.post('/', ...admin, validate({ body: tripCreateSchema }), async (req, res) => {
   const b = req.valid.body;
   if (Date.parse(b.departureAt) <= Date.now()) throw AppError.badRequest('Departure must be in the future');
@@ -155,13 +190,17 @@ router.post('/', ...admin, validate({ body: tripCreateSchema }), async (req, res
     const arrivalAt = new Date(Date.parse(b.departureAt) + route.estDurationMinutes * 60_000).toISOString();
     await assertBusFree(client, b.busId, b.departureAt, arrivalAt);
     await assertDriversValid(client, [b.driverId, b.coDriverId]);
+    await assertConductorValid(client, b.conductorId);
 
-    return one(
+    const trip = await one(
       `INSERT INTO trips (route_id, bus_id, driver_id, co_driver_id, hostess_name, departure_at, arrival_at, booking_closes_at)
        VALUES ($1, $2, $3, $4, $5, $6, $7, $6::timestamptz - make_interval(mins => $8)) RETURNING *`,
       [b.routeId, b.busId, b.driverId ?? null, b.coDriverId ?? null, b.hostessName ?? null, b.departureAt, arrivalAt, b.bookingCloseMinutes],
       client,
     );
+    // Separate statement so creating trips keeps working on a database without the conductor column.
+    if (b.conductorId) return one(`UPDATE trips SET conductor_id = $2 WHERE id = $1 RETURNING *`, [trip.id, b.conductorId], client);
+    return trip;
   });
   await audit({ req, action: 'trip.create', entityType: 'trip', entityId: trip.id, newData: trip });
   res.status(201).json({ data: trip });
@@ -183,9 +222,21 @@ router.get(
     const q = req.valid.query;
     const { rows } = await query(
       `SELECT t.*, r.name AS route_name, b.registration_no, d.full_name AS driver_name,
-              (SELECT count(*) FROM tickets tk WHERE tk.trip_id = t.id AND tk.status IN ${ACTIVE_TICKET})::int AS seats_taken
+              cn.full_name AS conductor_name, si.full_name AS stand_in_conductor_name,
+              (SELECT count(*) FROM tickets tk WHERE tk.trip_id = t.id AND tk.status IN ${ACTIVE_TICKET})::int AS seats_taken,
+              (SELECT count(*) FROM trip_vouchers tv WHERE tv.trip_id = t.id AND tv.status = 'generated')::int AS vouchers_generated,
+              lv.terminal_name AS last_left, lv.generated_at AS last_left_at,
+              r.destination_terminal_id, dt.is_origin AS ends_at_origin,
+              (SELECT l.round_trip_id FROM round_trip_legs l WHERE l.trip_id = t.id) AS round_trip_id
        FROM trips t JOIN routes r ON r.id = t.route_id JOIN buses b ON b.id = t.bus_id
        LEFT JOIN drivers d ON d.id = t.driver_id
+       JOIN terminals dt ON dt.id = r.destination_terminal_id
+       LEFT JOIN conductors cn ON cn.id = t.conductor_id
+       LEFT JOIN users si ON si.id = t.stand_in_conductor_id
+       LEFT JOIN LATERAL (
+          SELECT tv.terminal_name, tv.generated_at FROM trip_vouchers tv
+          WHERE tv.trip_id = t.id AND tv.status = 'generated' ORDER BY tv.generated_at DESC LIMIT 1
+       ) lv ON TRUE
        WHERE (t.departure_at AT TIME ZONE 'Asia/Karachi')::date = $1::date
          AND ($2::int IS NULL OR t.route_id = $2)
          AND ($3::trip_status IS NULL OR t.status = $3)
@@ -199,7 +250,7 @@ router.get(
 /** Assign bus / crew. Bus change is only allowed if the new bus uses the same seat layout. */
 router.patch(
   '/:id/assignment',
-  ...admin,
+  ...manager,
   validate({
     params: bigIdParam,
     body: z
@@ -207,6 +258,9 @@ router.patch(
         busId: intId,
         driverId: intId.nullable(),
         coDriverId: intId.nullable(),
+        conductorId: intId.nullable(),
+        // A staff member sent as conductor when the conductor could not go. Can be set after the trip too.
+        standInConductorId: z.string().uuid().nullable(),
         hostessName: personName.nullable(),
       })
       .partial()
@@ -222,7 +276,22 @@ router.patch(
         client,
       );
       if (!t) throw AppError.notFound('Trip not found');
-      if (['departed', 'arrived', 'cancelled'].includes(t.status)) throw AppError.conflict(`Trip is already ${t.status}`);
+      if (t.status === 'cancelled') throw AppError.conflict('Trip is cancelled');
+      if (['departed', 'arrived'].includes(t.status)) {
+        // After departure only the stand-in conductor may still be recorded (meeting, 35).
+        const other = Object.keys(b).filter((k) => k !== 'standInConductorId');
+        if (other.length) throw AppError.conflict(`Trip is already ${t.status}: only the stand-in conductor can still be set`);
+        await assertStandInValid(client, b.standInConductorId);
+        return one(`UPDATE trips SET stand_in_conductor_id = $2 WHERE id = $1 RETURNING *`, [id, b.standInConductorId ?? null], client);
+      }
+      await assertConductorValid(client, b.conductorId);
+      await assertStandInValid(client, b.standInConductorId);
+      if (b.conductorId !== undefined || b.standInConductorId !== undefined) {
+        await client.query(
+          `UPDATE trips SET conductor_id = $2, stand_in_conductor_id = $3 WHERE id = $1`,
+          [id, b.conductorId !== undefined ? b.conductorId : t.conductorId, b.standInConductorId !== undefined ? b.standInConductorId : t.standInConductorId],
+        );
+      }
 
       if (b.busId && b.busId !== t.busId) {
         const nb = await one(`SELECT layout_id FROM buses WHERE id = $1 AND is_active`, [b.busId], client);
@@ -257,7 +326,7 @@ const TRANSITIONS = {
 
 router.patch(
   '/:id/status',
-  ...staff,
+  ...staff, // counter staff: only "arrived", at their own terminal (checked below); everything else: managers and up
   validate({
     params: bigIdParam,
     body: z
@@ -278,17 +347,33 @@ router.patch(
     }
 
     const result = await withTransaction(async (client) => {
-      const t = await one(`SELECT id, status FROM trips WHERE id = $1 FOR UPDATE`, [id], client);
+      const t = await one(
+        `SELECT t.id, t.status, t.conductor_id, t.stand_in_conductor_id, r.destination_terminal_id
+         FROM trips t JOIN routes r ON r.id = t.route_id WHERE t.id = $1 FOR UPDATE OF t`,
+        [id],
+        client,
+      );
       if (!t) throw AppError.notFound('Trip not found');
+      if (!MANAGER_ROLES.includes(req.user.role)) {
+        // Counter staff see the bus come in: they may mark Arrived for buses ending at their own terminal, nothing else.
+        if (b.status !== 'arrived' || !req.user.terminalId || req.user.terminalId !== t.destinationTerminalId) {
+          throw AppError.forbidden('Counter staff can only mark buses as arrived at their own terminal.');
+        }
+      }
       if (t.status !== b.status && !TRANSITIONS[t.status].includes(b.status)) {
         throw AppError.conflict(`Cannot change trip from ${t.status} to ${b.status}`);
       }
+      // The bus does not move without a conductor.
+      if (['boarding', 'departed'].includes(b.status) && !t.conductorId && !t.standInConductorId) {
+        throw AppError.unprocessable('Assign a conductor first (Bus & crew). The bus cannot leave without one.');
+      }
 
       const trip = await one(
-        `UPDATE trips SET status = $2,
+        `UPDATE trips SET status = $2::trip_status,
                 delay_minutes = COALESCE($3, delay_minutes),
-                cancel_reason = CASE WHEN $2 = 'cancelled' THEN $4 ELSE cancel_reason END,
-                booking_open  = CASE WHEN $2 IN ('departed','arrived','cancelled') THEN FALSE ELSE COALESCE($5, booking_open) END
+                cancel_reason = CASE WHEN $2::trip_status = 'cancelled' THEN $4 ELSE cancel_reason END,
+                -- Departed from the first terminal does NOT close booking: later terminals sell until their voucher.
+                booking_open  = CASE WHEN $2::trip_status IN ('arrived','cancelled') THEN FALSE ELSE COALESCE($5, booking_open) END
          WHERE id = $1 RETURNING *`,
         [id, b.status, b.delayMinutes ?? null, b.reason ?? null, b.bookingOpen ?? null],
         client,
@@ -311,15 +396,27 @@ router.patch(
            WHERE p.booking_id = ANY ($1::uuid[]) AND p.status = 'succeeded'`,
           [bookings.map((x) => x.id)],
         );
+        // Its vouchers are voided; their numbers stay on record.
+        await client.query(
+          `UPDATE trip_vouchers SET status = 'void', closed_at = now(), closed_reason = 'Trip cancelled: ' || $2::text
+           WHERE trip_id = $1 AND status = 'generated'`,
+          [id, b.reason],
+        );
       }
       if (b.status === 'arrived') {
         await client.query(`UPDATE bookings SET status = 'completed' WHERE trip_id = $1 AND status = 'confirmed'`, [id]);
       }
-      return { trip, affectedBookings };
+      // Round trip reports made automatically: arriving at an origin terminal (Lahore, Multan) closes the bus's
+      // round trip; leaving an origin again closes a round trip nobody marked as arrived. Never blocks the change.
+      let autoReport = null;
+      if (b.status === 'arrived' && t.status !== 'arrived') autoReport = await autoCreateReport(client, { tripId: id, userId: req.user.id });
+      if (['boarding', 'departed'].includes(b.status)) autoReport = await closePreviousRoundTrip(client, { tripId: id, userId: req.user.id });
+      return { trip, affectedBookings, autoReport };
     });
 
     await audit({ req, action: 'trip.status', entityType: 'trip', entityId: id, newData: b });
-    res.json({ data: result.trip, affectedBookings: result.affectedBookings });
+    if (result.autoReport?.error) req.log?.warn({ tripId: id, err: result.autoReport.error }, 'Automatic round trip report not made');
+    res.json({ data: result.trip, affectedBookings: result.affectedBookings, autoReport: result.autoReport });
   },
 );
 

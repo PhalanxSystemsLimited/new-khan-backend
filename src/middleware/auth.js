@@ -2,8 +2,19 @@ import { supabaseAdmin } from '../config/supabase.js';
 import { one } from '../config/db.js';
 import { AppError } from '../utils/AppError.js';
 
-export const STAFF_ROLES = ['agent', 'admin', 'super_admin'];
+/*
+ * Roles (see README §6.5):
+ *   agent (shown as "Counter staff", tied to a terminal) · conductor · manager · admin · super_admin
+ * STAFF_ROLES   = everyone who works the counter: sell, board, see bookings and vouchers.
+ * MANAGER_ROLES = managers and up: trip status and crew, replacement vouchers, reports.
+ * ADMIN_ROLES   = prices, routes, buses, settings.
+ * Conductors only reach the conductor screen (their own trips) and the trip report QR page.
+ * Drivers only reach their own trips (/me/trips).
+ */
+export const STAFF_ROLES = ['agent', 'manager', 'admin', 'super_admin'];
+export const MANAGER_ROLES = ['manager', 'admin', 'super_admin'];
 export const ADMIN_ROLES = ['admin', 'super_admin'];
+export const EMPLOYEE_ROLES = ['agent', 'driver', 'conductor', 'manager', 'admin', 'super_admin'];
 
 function extractToken(req) {
   const header = req.headers.authorization;
@@ -15,7 +26,7 @@ function extractToken(req) {
 
 async function loadProfile(authUser) {
   let profile = await one(
-    `SELECT id, full_name, email, phone, role, is_active FROM users WHERE id = $1`,
+    `SELECT id, full_name, email, phone, role, is_active, terminal_id FROM users WHERE id = $1`,
     [authUser.id],
   );
   if (!profile) {
@@ -33,7 +44,7 @@ async function loadProfile(authUser) {
       ],
     );
     profile = await one(
-      `SELECT id, full_name, email, phone, role, is_active FROM users WHERE id = $1`,
+      `SELECT id, full_name, email, phone, role, is_active, terminal_id FROM users WHERE id = $1`,
       [authUser.id],
     );
   }
@@ -82,4 +93,6 @@ export function requireRole(...roles) {
 }
 
 export const isStaff = (user) => Boolean(user && STAFF_ROLES.includes(user.role));
+export const isManager = (user) => Boolean(user && MANAGER_ROLES.includes(user.role));
 export const isAdmin = (user) => Boolean(user && ADMIN_ROLES.includes(user.role));
+export const isEmployee = (user) => Boolean(user && EMPLOYEE_ROLES.includes(user.role));

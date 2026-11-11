@@ -125,7 +125,7 @@ export async function createBooking(user, input) {
 
     // Lock the trip row in share mode so it cannot be cancelled mid-booking.
     const trip = await one(
-      `SELECT t.id, t.route_id, t.status, t.booking_open, t.booking_closes_at, t.departure_at, b.bus_class
+      `SELECT t.id, t.route_id, t.status, t.booking_open, t.booking_closes_at, t.departure_at, t.delay_minutes, b.bus_class
        FROM trips t JOIN buses b ON b.id = t.bus_id
        WHERE t.id = $1 FOR SHARE OF t`,
       [input.tripId],
@@ -150,14 +150,36 @@ export async function createBooking(user, input) {
       }
     }
 
-    const allowedStatuses = staff ? ['scheduled', 'delayed', 'boarding'] : ['scheduled', 'delayed'];
-    if (!allowedStatuses.includes(trip.status) || !trip.bookingOpen) {
+    // A bus that has left its first terminal can still be booked from the terminals ahead of it.
+    if (!['scheduled', 'delayed', 'boarding', 'departed'].includes(trip.status) || !trip.bookingOpen) {
       throw AppError.unprocessable('Booking is closed for this trip');
     }
+    const stop = await one(
+      `SELECT rs.minutes_from_origin, c.name AS city FROM route_stops rs JOIN terminals tm ON tm.id = rs.terminal_id
+       JOIN cities c ON c.id = tm.city_id WHERE rs.id = $1 AND rs.route_id = $2`,
+      [input.boardingStopId, trip.routeId],
+      client,
+    );
+    if (!stop) throw AppError.badRequest('That boarding terminal is not on this trip.');
+    // When the bus is due at the boarding terminal, delays included.
+    const dueAt = new Date(trip.departureAt).getTime() + (stop.minutesFromOrigin + (trip.delayMinutes ?? 0)) * 60_000;
+    // Booking from a terminal closes when its voucher is generated (the trip row lock above keeps this exact).
+    const closed = await one(
+      `SELECT voucher_no FROM trip_vouchers WHERE trip_id = $1 AND boarding_stop_id = $2 AND status IN ('generated', 'replaced') LIMIT 1`,
+      [trip.id, input.boardingStopId],
+      client,
+    );
+    if (closed) throw AppError.unprocessable('Booking from this terminal has closed: its voucher has been generated.');
+    // Promotions are for online bookings only (meeting, 16).
+    if (staff && input.promoCode) throw AppError.unprocessable('Promo codes are for online bookings only, not at the counter.');
     const now = Date.now();
-    if (new Date(trip.departureAt).getTime() <= now) throw AppError.unprocessable('This trip has already departed');
-    if (!staff && trip.bookingClosesAt && new Date(trip.bookingClosesAt).getTime() <= now) {
-      throw AppError.unprocessable('Online booking has closed for this trip. Please book at the counter.');
+    if (staff) {
+      // Counter: until the terminal's voucher (checked above); a departure 12 hours overdue is treated as gone.
+      if (dueAt <= now - 12 * 3_600_000) throw AppError.unprocessable('This departure has already passed.');
+    } else if (dueAt - env.ONLINE_CUTOFF_MINUTES * 60_000 <= now) {
+      throw AppError.unprocessable(
+        `Online booking from ${stop.city} has closed (${env.ONLINE_CUTOFF_MINUTES} minutes before the bus arrives). Please book at the ${stop.city} counter.`,
+      );
     }
 
     // Price is always computed server-side; the client never sends amounts.

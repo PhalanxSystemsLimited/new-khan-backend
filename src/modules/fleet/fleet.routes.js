@@ -4,6 +4,7 @@ import { query, one, withTransaction } from '../../config/db.js';
 import { validate } from '../../middleware/validate.js';
 import { requireAuth, requireRole, ADMIN_ROLES, STAFF_ROLES } from '../../middleware/auth.js';
 import { AppError } from '../../utils/AppError.js';
+import { audit } from '../../utils/audit.js';
 import { buildUpdate } from '../../utils/sql.js';
 import { busClass, cnic, idParam, intId, isoDate, personName, phone, text } from '../../utils/schemas.js';
 
@@ -115,6 +116,7 @@ const busSchema = z
     model: text(1, 60).optional(),
     manufactureYear: z.number().int().min(1980).max(2100).optional(),
     amenities: z.array(amenity).max(20).default([]),
+    hasHostess: z.boolean().optional(), // off-route "Daily hostess" applies only to these buses
     isActive: z.boolean().optional(),
   })
   .strict();
@@ -128,6 +130,7 @@ const BUS_COLS = {
   model: 'model',
   manufactureYear: 'manufacture_year',
   amenities: 'amenities',
+  hasHostess: 'has_hostess',
   isActive: 'is_active',
 };
 
@@ -146,6 +149,10 @@ router.post('/buses', ...admin, validate({ body: busSchema }), async (req, res) 
     [b.registrationNo, b.fleetNo ?? null, b.layoutId, b.busClass, b.make ?? null, b.model ?? null,
       b.manufactureYear ?? null, JSON.stringify([...new Set(b.amenities)]), b.isActive ?? null],
   );
+  // Separate statement: has_hostess only exists after db/migrations/2026-11-07-round-trip-reports.sql.
+  if (b.hasHostess !== undefined) {
+    Object.assign(bus, await one(`UPDATE buses SET has_hostess = $2 WHERE id = $1 RETURNING has_hostess`, [bus.id, b.hasHostess]));
+  }
   res.status(201).json({ data: bus });
 });
 
@@ -210,6 +217,106 @@ router.patch('/drivers/:id', ...admin, validate({ params: idParam, body: driverS
   const driver = await one(`UPDATE drivers SET ${setSql} WHERE id = $1 RETURNING *`, [req.valid.params.id, ...values]);
   if (!driver) throw AppError.notFound('Driver not found');
   res.json({ data: driver });
+});
+
+// ======================= Conductors (with an optional login account) =======================
+const conductorSchema = z
+  .object({
+    fullName: personName,
+    phone,
+    cnic: cnic.optional(),
+    userId: z.string().uuid().nullable().optional(), // the conductor's login (an account with the Conductor role)
+    isActive: z.boolean().optional(),
+  })
+  .strict();
+
+const CONDUCTOR_COLS = { fullName: 'full_name', phone: 'phone', cnic: 'cnic', userId: 'user_id', isActive: 'is_active' };
+
+async function assertConductorLogin(userId) {
+  if (!userId) return;
+  const u = await one(`SELECT role FROM users WHERE id = $1`, [userId]);
+  if (!u) throw AppError.badRequest('Login account not found');
+  if (u.role !== 'conductor') throw AppError.unprocessable('Give that account the Conductor role first (Users & staff).');
+}
+
+const uniqueConductor = (err) => {
+  if (err.code === '23505') throw AppError.conflict('Another conductor already has this CNIC or login account.');
+  throw err;
+};
+
+router.get('/conductors', ...staff, async (_req, res) => {
+  const { rows } = await query(
+    `SELECT c.*, u.email AS login_email, u.full_name AS login_name FROM conductors c
+     LEFT JOIN users u ON u.id = c.user_id ORDER BY c.full_name`,
+  );
+  res.json({ data: rows });
+});
+
+router.post('/conductors', ...admin, validate({ body: conductorSchema }), async (req, res) => {
+  const c = req.valid.body;
+  await assertConductorLogin(c.userId);
+  const row = await one(
+    `INSERT INTO conductors (full_name, phone, cnic, user_id, is_active) VALUES ($1, $2, $3, $4, COALESCE($5, TRUE)) RETURNING *`,
+    [c.fullName, c.phone, c.cnic ?? null, c.userId ?? null, c.isActive ?? null],
+  ).catch(uniqueConductor);
+  await audit({ req, action: 'conductor.create', entityType: 'conductor', entityId: row.id, newData: row });
+  res.status(201).json({ data: row });
+});
+
+router.patch('/conductors/:id', ...admin, validate({ params: idParam, body: conductorSchema.partial() }), async (req, res) => {
+  if (req.valid.body.userId) await assertConductorLogin(req.valid.body.userId);
+  const before = await one(`SELECT * FROM conductors WHERE id = $1`, [req.valid.params.id]);
+  if (!before) throw AppError.notFound('Conductor not found');
+  const { setSql, values } = buildUpdate(req.valid.body, CONDUCTOR_COLS, 2);
+  const row = await one(`UPDATE conductors SET ${setSql} WHERE id = $1 RETURNING *`, [req.valid.params.id, ...values]).catch(uniqueConductor);
+  await audit({ req, action: 'conductor.update', entityType: 'conductor', entityId: row.id, oldData: before, newData: req.valid.body });
+  res.json({ data: row });
+});
+
+// ======================= Staff directory (people who work but do not sign in) =======================
+const JOBS = ['cleaner', 'loader', 'helper', 'guard', 'other'];
+const staffMemberSchema = z
+  .object({
+    fullName: personName,
+    phone: phone.optional(),
+    cnic: cnic.optional(),
+    job: z.enum(JOBS),
+    terminalId: intId.nullable().optional(),
+    notes: text(1, 300).optional(),
+    isActive: z.boolean().optional(),
+  })
+  .strict();
+
+const STAFF_MEMBER_COLS = {
+  fullName: 'full_name', phone: 'phone', cnic: 'cnic', job: 'job', terminalId: 'terminal_id', notes: 'notes', isActive: 'is_active',
+};
+
+router.get('/staff-directory', ...staff, async (_req, res) => {
+  const { rows } = await query(
+    `SELECT s.*, c.name || ' · ' || t.name AS terminal_name FROM staff_directory s
+     LEFT JOIN terminals t ON t.id = s.terminal_id LEFT JOIN cities c ON c.id = t.city_id
+     ORDER BY s.is_active DESC, s.full_name`,
+  );
+  res.json({ data: rows });
+});
+
+router.post('/staff-directory', ...admin, validate({ body: staffMemberSchema }), async (req, res) => {
+  const s = req.valid.body;
+  const row = await one(
+    `INSERT INTO staff_directory (full_name, phone, cnic, job, terminal_id, notes, is_active)
+     VALUES ($1, $2, $3, $4, $5, $6, COALESCE($7, TRUE)) RETURNING *`,
+    [s.fullName, s.phone ?? null, s.cnic ?? null, s.job, s.terminalId ?? null, s.notes ?? null, s.isActive ?? null],
+  );
+  await audit({ req, action: 'staff_member.create', entityType: 'staff_member', entityId: row.id, newData: row });
+  res.status(201).json({ data: row });
+});
+
+router.patch('/staff-directory/:id', ...admin, validate({ params: idParam, body: staffMemberSchema.partial() }), async (req, res) => {
+  const { setSql, values } = buildUpdate(req.valid.body, STAFF_MEMBER_COLS, 2);
+  const row = await one(`UPDATE staff_directory SET ${setSql} WHERE id = $1 RETURNING *`, [req.valid.params.id, ...values]);
+  if (!row) throw AppError.notFound('Not found');
+  await audit({ req, action: 'staff_member.update', entityType: 'staff_member', entityId: row.id, newData: req.valid.body });
+  res.json({ data: row });
 });
 
 export default router;

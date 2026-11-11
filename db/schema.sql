@@ -23,7 +23,7 @@ BEGIN;
 -- ---------------------------------------------------------------------
 -- 1. ENUM TYPES
 -- ---------------------------------------------------------------------
-CREATE TYPE user_role        AS ENUM ('customer', 'agent', 'admin', 'super_admin');
+CREATE TYPE user_role        AS ENUM ('customer', 'agent', 'driver', 'conductor', 'manager', 'admin', 'super_admin');
 CREATE TYPE bus_class        AS ENUM ('economy', 'executive', 'business', 'sleeper');
 CREATE TYPE seat_kind        AS ENUM ('standard', 'window', 'aisle', 'sleeper', 'driver', 'blocked');
 CREATE TYPE trip_status      AS ENUM ('scheduled', 'boarding', 'departed', 'arrived', 'cancelled', 'delayed');
@@ -34,7 +34,7 @@ CREATE TYPE payment_method   AS ENUM ('cash', 'card', 'jazzcash', 'easypaisa', '
 CREATE TYPE refund_status    AS ENUM ('requested', 'approved', 'processed', 'rejected');
 CREATE TYPE gender_type      AS ENUM ('male', 'female', 'other');
 CREATE TYPE discount_type    AS ENUM ('percentage', 'fixed');
-CREATE TYPE booking_channel  AS ENUM ('web', 'mobile_app', 'counter', 'phone', 'agent');
+CREATE TYPE booking_channel  AS ENUM ('web', 'mobile_app', 'counter', 'phone', 'agent', 'on_road');
 
 -- ---------------------------------------------------------------------
 -- 2. HELPER: auto-maintain updated_at
@@ -820,6 +820,764 @@ INSERT INTO cities (name, province) VALUES
     ('Multan',     'Punjab'),
     ('Peshawar',   'Khyber Pakhtunkhwa'),
     ('Karachi',    'Sindh');
+
+-- ---------------------------------------------------------------------
+-- 19. ROUND TRIP REPORTS (same as db/migrations/2026-11-07-round-trip-reports.sql)
+-- ---------------------------------------------------------------------
+-- ---------------------------------------------------------------------------------------------------------------
+-- 1. Lists managed in the admin panel
+-- ---------------------------------------------------------------------------------------------------------------
+ALTER TABLE buses ADD COLUMN IF NOT EXISTS has_hostess BOOLEAN NOT NULL DEFAULT FALSE;
+
+CREATE TABLE IF NOT EXISTS onroute_categories (          -- Adda, TMA, Welfare ... (entered per voucher)
+    id          SERIAL PRIMARY KEY,
+    name        VARCHAR(60) NOT NULL,
+    sort_order  SMALLINT NOT NULL DEFAULT 0,
+    is_active   BOOLEAN NOT NULL DEFAULT TRUE,
+    created_at  TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE UNIQUE INDEX IF NOT EXISTS onroute_categories_name_uq ON onroute_categories (lower(name));
+
+CREATE TABLE IF NOT EXISTS online_platforms (            -- Web app, Bookme, Bookkaro ...
+    id          SERIAL PRIMARY KEY,
+    name        VARCHAR(60) NOT NULL,
+    sort_order  SMALLINT NOT NULL DEFAULT 0,
+    is_active   BOOLEAN NOT NULL DEFAULT TRUE,
+    created_at  TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE UNIQUE INDEX IF NOT EXISTS online_platforms_name_uq ON online_platforms (lower(name));
+
+CREATE TABLE IF NOT EXISTS offroute_categories (         -- Daily driver, E-tag / toll tax ...
+    id               SERIAL PRIMARY KEY,
+    name             VARCHAR(80) NOT NULL,
+    sort_order       SMALLINT NOT NULL DEFAULT 0,
+    is_active        BOOLEAN NOT NULL DEFAULT TRUE,     -- deactivated, never deleted
+    requires_hostess BOOLEAN NOT NULL DEFAULT FALSE,    -- only on buses that carry a hostess
+    bus_classes      bus_class[] NOT NULL DEFAULT '{}', -- empty = every bus class
+    created_at       TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at       TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE UNIQUE INDEX IF NOT EXISTS offroute_categories_name_uq ON offroute_categories (lower(name));
+
+-- One row per category for the global default (route_id NULL) and one per route that differs.
+-- is_enabled = FALSE on a route row switches the category off for that route.
+CREATE TABLE IF NOT EXISTS offroute_defaults (
+    id           SERIAL PRIMARY KEY,
+    category_id  INT NOT NULL REFERENCES offroute_categories(id) ON DELETE CASCADE,
+    route_id     INT REFERENCES routes(id) ON DELETE CASCADE,
+    amount       INT NOT NULL DEFAULT 0 CHECK (amount >= 0),
+    is_enabled   BOOLEAN NOT NULL DEFAULT TRUE,
+    updated_by   UUID REFERENCES users(id) ON DELETE SET NULL,
+    updated_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
+    CONSTRAINT offroute_defaults_uq UNIQUE NULLS NOT DISTINCT (category_id, route_id)
+);
+
+-- ---------------------------------------------------------------------------------------------------------------
+-- 2. Round trips
+-- ---------------------------------------------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS round_trips (
+    id                  BIGSERIAL PRIMARY KEY,                -- the "Report ID"
+    route_id            INT REFERENCES routes(id) ON DELETE SET NULL,  -- picks the off-route defaults
+    bus_id              INT NOT NULL REFERENCES buses(id),
+    driver_id           INT REFERENCES drivers(id) ON DELETE SET NULL,
+    driver_name         VARCHAR(120),                         -- as printed (taken from the driver when blank)
+    fare_collector      VARCHAR(120),
+    route_label         VARCHAR(120) NOT NULL,                -- e.g. LHR ⇄ DIK via MWL
+    report_date         DATE NOT NULL,
+    report_time         TIME,
+    distance_km         NUMERIC(8,2) NOT NULL DEFAULT 0 CHECK (distance_km >= 0),
+    mobil_oil           NUMERIC(8,2) NOT NULL DEFAULT 0 CHECK (mobil_oil >= 0),
+    other_expense       INT NOT NULL DEFAULT 0 CHECK (other_expense >= 0),
+    other_expense_note  VARCHAR(200),
+    other_income        INT NOT NULL DEFAULT 0 CHECK (other_income >= 0),
+    other_income_note   VARCHAR(200),
+    cashier_name        VARCHAR(120),
+    cash_received_at    TIMESTAMPTZ,
+    incharge_name       VARCHAR(120),
+    status              VARCHAR(10) NOT NULL DEFAULT 'draft',
+    finalized_at        TIMESTAMPTZ,
+    finalized_by        UUID REFERENCES users(id) ON DELETE SET NULL,
+    created_by          UUID REFERENCES users(id) ON DELETE SET NULL,
+    created_at          TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at          TIMESTAMPTZ NOT NULL DEFAULT now(),   -- "last updated" on the report: bumped on every edit
+    CONSTRAINT round_trips_status_valid CHECK (status IN ('draft', 'finalized')),
+    CONSTRAINT round_trips_finalized_has_time CHECK (status = 'draft' OR finalized_at IS NOT NULL)
+);
+CREATE INDEX IF NOT EXISTS round_trips_date_idx ON round_trips (report_date DESC, id DESC);
+CREATE INDEX IF NOT EXISTS round_trips_bus_idx ON round_trips (bus_id, report_date DESC);
+
+CREATE TABLE IF NOT EXISTS round_trip_legs (
+    id             BIGSERIAL PRIMARY KEY,
+    round_trip_id  BIGINT NOT NULL REFERENCES round_trips(id) ON DELETE CASCADE,
+    leg_no         SMALLINT NOT NULL CHECK (leg_no > 0),
+    title          VARCHAR(150) NOT NULL,                     -- e.g. Lahore to DIK via Mianwali
+    leg_ref        VARCHAR(40),                               -- optional leg-level paper reference number
+    CONSTRAINT round_trip_legs_no_uq UNIQUE (round_trip_id, leg_no)
+);
+
+CREATE TABLE IF NOT EXISTS round_trip_fuel_entries (
+    id             BIGSERIAL PRIMARY KEY,
+    round_trip_id  BIGINT NOT NULL REFERENCES round_trips(id) ON DELETE CASCADE,
+    sort_order     SMALLINT NOT NULL DEFAULT 0,
+    station        VARCHAR(30) NOT NULL,                      -- e.g. LHR
+    litres         NUMERIC(10,3) NOT NULL CHECK (litres > 0),
+    rate           NUMERIC(10,3) NOT NULL CHECK (rate >= 0),  -- per litre
+    amount         INT NOT NULL CHECK (amount >= 0)           -- billed amount; prefilled as round(litres x rate)
+);
+CREATE INDEX IF NOT EXISTS round_trip_fuel_trip_idx ON round_trip_fuel_entries (round_trip_id, sort_order);
+
+-- The trip's own copy of each off-route line, made when the trip is created.
+CREATE TABLE IF NOT EXISTS round_trip_offroute_lines (
+    id              BIGSERIAL PRIMARY KEY,
+    round_trip_id   BIGINT NOT NULL REFERENCES round_trips(id) ON DELETE CASCADE,
+    category_id     INT REFERENCES offroute_categories(id) ON DELETE SET NULL,
+    name            VARCHAR(80) NOT NULL,
+    amount          INT NOT NULL CHECK (amount >= 0),
+    default_amount  INT NOT NULL CHECK (default_amount >= 0), -- the default when copied
+    sort_order      SMALLINT NOT NULL DEFAULT 0,
+    is_overridden   BOOLEAN NOT NULL DEFAULT FALSE,
+    overridden_by   UUID REFERENCES users(id) ON DELETE SET NULL,
+    overridden_at   TIMESTAMPTZ
+);
+CREATE INDEX IF NOT EXISTS round_trip_offroute_trip_idx ON round_trip_offroute_lines (round_trip_id, sort_order);
+
+-- ---------------------------------------------------------------------------------------------------------------
+-- 3. Terminal vouchers (one row of the sales table each)
+-- ---------------------------------------------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS voucher_counter (
+    id       SMALLINT PRIMARY KEY CHECK (id = 1),
+    last_no  BIGINT NOT NULL CHECK (last_no < 9999999999)
+);
+INSERT INTO voucher_counter (id, last_no) VALUES (1, 1000000000) ON CONFLICT (id) DO NOTHING;
+
+/** Next voucher number. The counter row stays locked until the inserting transaction ends, so two requests
+    can never get the same number, and a rolled-back insert gives its number back (no gaps). */
+CREATE OR REPLACE FUNCTION next_voucher_no()
+RETURNS TEXT LANGUAGE sql VOLATILE SET search_path = public AS $$
+    UPDATE voucher_counter SET last_no = last_no + 1 WHERE id = 1 RETURNING lpad(last_no::TEXT, 10, '0');
+$$;
+
+CREATE TABLE IF NOT EXISTS terminal_vouchers (
+    id             BIGSERIAL PRIMARY KEY,
+    voucher_no     VARCHAR(10) NOT NULL,
+    round_trip_id  BIGINT NOT NULL REFERENCES round_trips(id) ON DELETE CASCADE,
+    leg_id         BIGINT NOT NULL REFERENCES round_trip_legs(id) ON DELETE CASCADE,
+    sort_order     SMALLINT NOT NULL DEFAULT 0,
+    terminal_id    INT REFERENCES terminals(id) ON DELETE SET NULL,
+    terminal_name  VARCHAR(120) NOT NULL,                     -- as printed
+    departure_at   TIMESTAMPTZ,
+    pax_terminal   INT NOT NULL DEFAULT 0 CHECK (pax_terminal >= 0),
+    pax_enroute    INT NOT NULL DEFAULT 0 CHECK (pax_enroute >= 0),
+    inc_terminal   INT NOT NULL DEFAULT 0 CHECK (inc_terminal >= 0),
+    inc_enroute    INT NOT NULL DEFAULT 0 CHECK (inc_enroute >= 0),
+    load_amount    INT NOT NULL DEFAULT 0 CHECK (load_amount >= 0),
+    cargo_amount   INT NOT NULL DEFAULT 0 CHECK (cargo_amount >= 0),
+    created_by     UUID REFERENCES users(id) ON DELETE SET NULL,
+    created_at     TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at     TIMESTAMPTZ NOT NULL DEFAULT now(),
+    CONSTRAINT terminal_vouchers_no_uq UNIQUE (voucher_no),
+    CONSTRAINT terminal_vouchers_no_format CHECK (voucher_no ~ '^[0-9]{10}$')
+);
+CREATE INDEX IF NOT EXISTS terminal_vouchers_trip_idx ON terminal_vouchers (round_trip_id, leg_id, sort_order);
+
+CREATE OR REPLACE FUNCTION set_voucher_no()
+RETURNS TRIGGER LANGUAGE plpgsql SET search_path = public AS $$
+BEGIN
+    NEW.voucher_no := next_voucher_no();   -- always system-generated, whatever the insert says
+    RETURN NEW;
+END;
+$$;
+DROP TRIGGER IF EXISTS terminal_vouchers_set_no ON terminal_vouchers;
+CREATE TRIGGER terminal_vouchers_set_no BEFORE INSERT ON terminal_vouchers
+    FOR EACH ROW EXECUTE FUNCTION set_voucher_no();
+
+CREATE OR REPLACE FUNCTION keep_voucher_no()
+RETURNS TRIGGER LANGUAGE plpgsql SET search_path = public AS $$
+BEGIN
+    IF NEW.voucher_no IS DISTINCT FROM OLD.voucher_no THEN
+        RAISE EXCEPTION 'A voucher number cannot be changed';
+    END IF;
+    RETURN NEW;
+END;
+$$;
+DROP TRIGGER IF EXISTS terminal_vouchers_keep_no ON terminal_vouchers;
+CREATE TRIGGER terminal_vouchers_keep_no BEFORE UPDATE OF voucher_no ON terminal_vouchers
+    FOR EACH ROW EXECUTE FUNCTION keep_voucher_no();
+
+CREATE TABLE IF NOT EXISTS voucher_onroute_lines (
+    id           BIGSERIAL PRIMARY KEY,
+    voucher_id   BIGINT NOT NULL REFERENCES terminal_vouchers(id) ON DELETE CASCADE,
+    category_id  INT REFERENCES onroute_categories(id) ON DELETE SET NULL,
+    name         VARCHAR(60) NOT NULL,
+    amount       INT NOT NULL CHECK (amount >= 0)
+);
+CREATE INDEX IF NOT EXISTS voucher_onroute_voucher_idx ON voucher_onroute_lines (voucher_id);
+
+CREATE TABLE IF NOT EXISTS voucher_online_sales (
+    id             BIGSERIAL PRIMARY KEY,
+    voucher_id     BIGINT NOT NULL REFERENCES terminal_vouchers(id) ON DELETE CASCADE,
+    platform_id    INT REFERENCES online_platforms(id) ON DELETE SET NULL,
+    platform_name  VARCHAR(60) NOT NULL,
+    seats          INT NOT NULL DEFAULT 0 CHECK (seats >= 0),
+    amount         INT NOT NULL CHECK (amount >= 0)
+);
+CREATE INDEX IF NOT EXISTS voucher_online_voucher_idx ON voucher_online_sales (voucher_id);
+
+-- ---------------------------------------------------------------------------------------------------------------
+-- 4. QR tokens (one live token per voucher, plus one for the report header) and scans
+-- ---------------------------------------------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS report_tokens (
+    id             BIGSERIAL PRIMARY KEY,
+    token          VARCHAR(32) NOT NULL,                       -- 128-bit random, base64url
+    round_trip_id  BIGINT NOT NULL REFERENCES round_trips(id) ON DELETE CASCADE,
+    voucher_id     BIGINT REFERENCES terminal_vouchers(id) ON DELETE CASCADE,  -- NULL = report header QR
+    created_by     UUID REFERENCES users(id) ON DELETE SET NULL,
+    created_at     TIMESTAMPTZ NOT NULL DEFAULT now(),
+    revoked_at     TIMESTAMPTZ,
+    revoked_by     UUID REFERENCES users(id) ON DELETE SET NULL,
+    CONSTRAINT report_tokens_token_uq UNIQUE (token),
+    CONSTRAINT report_tokens_token_format CHECK (token ~ '^[A-Za-z0-9_-]{22,32}$')
+);
+CREATE UNIQUE INDEX IF NOT EXISTS report_tokens_live_voucher_uq ON report_tokens (voucher_id)
+    WHERE revoked_at IS NULL AND voucher_id IS NOT NULL;
+CREATE UNIQUE INDEX IF NOT EXISTS report_tokens_live_report_uq ON report_tokens (round_trip_id)
+    WHERE revoked_at IS NULL AND voucher_id IS NULL;
+
+CREATE TABLE IF NOT EXISTS report_scans (
+    id             BIGSERIAL PRIMARY KEY,
+    token_id       BIGINT NOT NULL REFERENCES report_tokens(id) ON DELETE CASCADE,
+    round_trip_id  BIGINT NOT NULL REFERENCES round_trips(id) ON DELETE CASCADE,
+    voucher_id     BIGINT REFERENCES terminal_vouchers(id) ON DELETE SET NULL,
+    user_id        UUID REFERENCES users(id) ON DELETE SET NULL,
+    ip_address     INET,
+    scanned_at     TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS report_scans_trip_idx ON report_scans (round_trip_id, scanned_at DESC);
+
+-- ---------------------------------------------------------------------------------------------------------------
+-- 5. Security: the backend connects as the table owner; the browser (anon/authenticated) gets nothing.
+-- ---------------------------------------------------------------------------------------------------------------
+DO $$
+DECLARE t TEXT;
+BEGIN
+    FOREACH t IN ARRAY ARRAY['onroute_categories','online_platforms','offroute_categories','offroute_defaults',
+        'round_trips','round_trip_legs','round_trip_fuel_entries','round_trip_offroute_lines','voucher_counter',
+        'terminal_vouchers','voucher_onroute_lines','voucher_online_sales','report_tokens','report_scans']
+    LOOP
+        EXECUTE format('ALTER TABLE %I ENABLE ROW LEVEL SECURITY', t);
+        EXECUTE format('REVOKE ALL ON %I FROM anon, authenticated', t);
+    END LOOP;
+END $$;
+REVOKE ALL ON FUNCTION next_voucher_no() FROM anon, authenticated, public;
+
+DROP TRIGGER IF EXISTS round_trips_set_updated_at ON round_trips;
+CREATE TRIGGER round_trips_set_updated_at BEFORE UPDATE ON round_trips FOR EACH ROW EXECUTE FUNCTION set_updated_at();
+DROP TRIGGER IF EXISTS offroute_categories_set_updated_at ON offroute_categories;
+CREATE TRIGGER offroute_categories_set_updated_at BEFORE UPDATE ON offroute_categories FOR EACH ROW EXECUTE FUNCTION set_updated_at();
+DROP TRIGGER IF EXISTS terminal_vouchers_set_updated_at ON terminal_vouchers;
+CREATE TRIGGER terminal_vouchers_set_updated_at BEFORE UPDATE ON terminal_vouchers FOR EACH ROW EXECUTE FUNCTION set_updated_at();
+
+-- ---------------------------------------------------------------------------------------------------------------
+-- 6. Starting lists (from the paper samples). Existing rows are left alone; admins edit them in the panel.
+-- ---------------------------------------------------------------------------------------------------------------
+INSERT INTO onroute_categories (name, sort_order) VALUES
+    ('Adda', 1), ('Booking clerk', 2), ('Howkery', 3), ('Manager', 4), ('TMA', 5), ('Welfare', 6)
+ON CONFLICT DO NOTHING;
+
+INSERT INTO online_platforms (name, sort_order) VALUES ('Web app', 1), ('Bookme', 2), ('Bookkaro', 3)
+ON CONFLICT DO NOTHING;
+
+INSERT INTO offroute_categories (name, sort_order, requires_hostess) VALUES
+    ('Air cleaning', 1, FALSE), ('Cleaning / washing', 2, FALSE), ('Daily conductor', 3, FALSE),
+    ('Daily driver', 4, FALSE), ('Daily hostess', 5, TRUE), ('E-tag / toll tax', 6, FALSE),
+    ('Extra hawkery', 7, FALSE), ('Greasing', 8, FALSE), ('Incentives', 9, FALSE),
+    ('Mechanic charges', 10, FALSE), ('Police daily expense', 11, FALSE), ('Tyre puncture etc.', 12, FALSE)
+ON CONFLICT DO NOTHING;
+
+-- Global defaults (used on every route without its own amount).
+INSERT INTO offroute_defaults (category_id, route_id, amount)
+SELECT c.id, NULL, v.amount
+FROM (VALUES ('Air cleaning', 130), ('Cleaning / washing', 550), ('Daily conductor', 2000), ('Daily driver', 3000),
+             ('Daily hostess', 500), ('E-tag / toll tax', 0), ('Extra hawkery', 500), ('Greasing', 130),
+             ('Incentives', 3000), ('Mechanic charges', 500), ('Police daily expense', 100), ('Tyre puncture etc.', 100)
+     ) AS v(name, amount)
+JOIN offroute_categories c ON lower(c.name) = lower(v.name)
+ON CONFLICT ON CONSTRAINT offroute_defaults_uq DO NOTHING;
+
+-- DIK routes (Trip 24319 sample): Daily conductor 2,500, Daily driver 3,650, E-tag / toll tax 10,380.
+INSERT INTO offroute_defaults (category_id, route_id, amount)
+SELECT c.id, r.id, v.amount
+FROM (VALUES ('Daily conductor', 2500), ('Daily driver', 3650), ('E-tag / toll tax', 10380)) AS v(name, amount)
+JOIN offroute_categories c ON lower(c.name) = lower(v.name)
+JOIN routes r ON r.code IN ('NK-LHR-DIK', 'NK-DIK-LHR')
+ON CONFLICT ON CONSTRAINT offroute_defaults_uq DO NOTHING;
+
+-- ---------------------------------------------------------------------
+-- 20. ROLES, CONDUCTORS, TERMINAL VOUCHERS (same as db/migrations/2026-11-10-terminal-vouchers-conductors.sql)
+-- ---------------------------------------------------------------------
+-- ---------------------------------------------------------------------------------------------------------------
+-- 1. Staff tied to a terminal
+-- ---------------------------------------------------------------------------------------------------------------
+ALTER TABLE users ADD COLUMN IF NOT EXISTS terminal_id INT REFERENCES terminals(id) ON DELETE SET NULL;
+CREATE INDEX IF NOT EXISTS users_terminal_idx ON users (terminal_id) WHERE terminal_id IS NOT NULL;
+
+-- ---------------------------------------------------------------------------------------------------------------
+-- 2. Conductors and the staff directory
+-- ---------------------------------------------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS conductors (
+    id          SERIAL PRIMARY KEY,
+    full_name   VARCHAR(120) NOT NULL,
+    phone       VARCHAR(20)  NOT NULL,
+    cnic        VARCHAR(15),
+    user_id     UUID REFERENCES users(id) ON DELETE SET NULL,   -- the conductor's login account
+    is_active   BOOLEAN NOT NULL DEFAULT TRUE,
+    created_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at  TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE UNIQUE INDEX IF NOT EXISTS conductors_cnic_uq ON conductors (cnic) WHERE cnic IS NOT NULL;
+CREATE UNIQUE INDEX IF NOT EXISTS conductors_user_uq ON conductors (user_id) WHERE user_id IS NOT NULL;
+
+CREATE TABLE IF NOT EXISTS staff_directory (             -- people who work but do not sign in
+    id          SERIAL PRIMARY KEY,
+    full_name   VARCHAR(120) NOT NULL,
+    phone       VARCHAR(20),
+    cnic        VARCHAR(15),
+    job         VARCHAR(20) NOT NULL DEFAULT 'other',
+    terminal_id INT REFERENCES terminals(id) ON DELETE SET NULL,
+    notes       VARCHAR(300),
+    is_active   BOOLEAN NOT NULL DEFAULT TRUE,
+    created_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
+    CONSTRAINT staff_directory_job_valid CHECK (job IN ('cleaner', 'loader', 'helper', 'guard', 'other'))
+);
+
+ALTER TABLE trips ADD COLUMN IF NOT EXISTS conductor_id INT REFERENCES conductors(id) ON DELETE SET NULL;
+ALTER TABLE trips ADD COLUMN IF NOT EXISTS stand_in_conductor_id UUID REFERENCES users(id) ON DELETE SET NULL;
+CREATE INDEX IF NOT EXISTS trips_conductor_idx ON trips (conductor_id, departure_at) WHERE conductor_id IS NOT NULL;
+CREATE INDEX IF NOT EXISTS trips_stand_in_idx ON trips (stand_in_conductor_id) WHERE stand_in_conductor_id IS NOT NULL;
+
+-- ---------------------------------------------------------------------------------------------------------------
+-- 3. Road passengers and no-shows
+-- ---------------------------------------------------------------------------------------------------------------
+ALTER TABLE tickets ADD COLUMN IF NOT EXISTS is_free BOOLEAN NOT NULL DEFAULT FALSE;      -- travelled free
+ALTER TABLE tickets ADD COLUMN IF NOT EXISTS no_show_note VARCHAR(300);                   -- e.g. "did not travel"
+ALTER TABLE tickets ADD COLUMN IF NOT EXISTS added_by UUID REFERENCES users(id) ON DELETE SET NULL; -- conductor
+
+-- ---------------------------------------------------------------------------------------------------------------
+-- 4. Fixed deductions per terminal (names come from the on-route list: Adda, loader, cleaner...)
+-- ---------------------------------------------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS terminal_deductions (
+    id           SERIAL PRIMARY KEY,
+    terminal_id  INT NOT NULL REFERENCES terminals(id) ON DELETE CASCADE,
+    category_id  INT NOT NULL REFERENCES onroute_categories(id) ON DELETE CASCADE,
+    amount       INT NOT NULL DEFAULT 0 CHECK (amount >= 0),
+    updated_by   UUID REFERENCES users(id) ON DELETE SET NULL,
+    updated_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
+    CONSTRAINT terminal_deductions_uq UNIQUE (terminal_id, category_id)
+);
+
+-- ---------------------------------------------------------------------------------------------------------------
+-- 5. Trip vouchers, generated at each terminal
+-- ---------------------------------------------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS trip_vouchers (
+    id                 BIGSERIAL PRIMARY KEY,
+    voucher_no         VARCHAR(10) NOT NULL,
+    trip_id            BIGINT NOT NULL REFERENCES trips(id) ON DELETE RESTRICT,
+    boarding_stop_id   INT NOT NULL REFERENCES route_stops(id) ON DELETE RESTRICT,
+    terminal_id        INT REFERENCES terminals(id) ON DELETE SET NULL,
+    status             VARCHAR(10) NOT NULL DEFAULT 'generated',
+    -- what was printed (frozen)
+    terminal_name      VARCHAR(120) NOT NULL,
+    route_name         VARCHAR(150) NOT NULL,
+    bus_id             INT REFERENCES buses(id) ON DELETE SET NULL,
+    bus_no             VARCHAR(20) NOT NULL,
+    driver_name        VARCHAR(120),
+    conductor_name     VARCHAR(120),
+    departure_at       TIMESTAMPTZ NOT NULL,                   -- this terminal's departure time
+    seats_boarding     INT NOT NULL DEFAULT 0,                 -- paid seats boarding at this terminal
+    fare_boarding      INT NOT NULL DEFAULT 0,
+    on_board           INT NOT NULL DEFAULT 0,                 -- everyone on the bus after this terminal
+    free_on_board      INT NOT NULL DEFAULT 0,
+    terminal_cash      INT NOT NULL DEFAULT 0,                 -- paid in cash at the counter
+    online_paid        INT NOT NULL DEFAULT 0,                 -- paid online (not in the conductor's hand)
+    load_amount        INT NOT NULL DEFAULT 0 CHECK (load_amount >= 0),
+    cargo_amount       INT NOT NULL DEFAULT 0 CHECK (cargo_amount >= 0),
+    deductions_total   INT NOT NULL DEFAULT 0,
+    cash_to_conductor  INT NOT NULL DEFAULT 0,                 -- terminal cash + load + cargo - deductions
+    generated_by       UUID REFERENCES users(id) ON DELETE SET NULL,
+    generated_by_name  VARCHAR(120) NOT NULL,
+    generated_at       TIMESTAMPTZ NOT NULL DEFAULT now(),
+    -- replacement / void
+    replaces_id        BIGINT REFERENCES trip_vouchers(id) ON DELETE SET NULL,
+    replace_reason     VARCHAR(300),
+    approved_by        UUID REFERENCES users(id) ON DELETE SET NULL,
+    approved_by_name   VARCHAR(120),
+    closed_at          TIMESTAMPTZ,                            -- when it was replaced or voided
+    closed_reason      VARCHAR(300),
+    CONSTRAINT trip_vouchers_no_uq UNIQUE (voucher_no),
+    CONSTRAINT trip_vouchers_no_format CHECK (voucher_no ~ '^[0-9]{10}$'),
+    CONSTRAINT trip_vouchers_status_valid CHECK (status IN ('generated', 'replaced', 'void'))
+);
+-- One live voucher per trip per terminal.
+CREATE UNIQUE INDEX IF NOT EXISTS trip_vouchers_live_uq ON trip_vouchers (trip_id, boarding_stop_id) WHERE status = 'generated';
+CREATE INDEX IF NOT EXISTS trip_vouchers_trip_idx ON trip_vouchers (trip_id, generated_at);
+CREATE INDEX IF NOT EXISTS trip_vouchers_generated_idx ON trip_vouchers (generated_at DESC);
+
+DROP TRIGGER IF EXISTS trip_vouchers_set_no ON trip_vouchers;
+CREATE TRIGGER trip_vouchers_set_no BEFORE INSERT ON trip_vouchers FOR EACH ROW EXECUTE FUNCTION set_voucher_no();
+DROP TRIGGER IF EXISTS trip_vouchers_keep_no ON trip_vouchers;
+CREATE TRIGGER trip_vouchers_keep_no BEFORE UPDATE OF voucher_no ON trip_vouchers FOR EACH ROW EXECUTE FUNCTION keep_voucher_no();
+
+-- Voucher numbers are unique across BOTH voucher tables (one series). The counter already guarantees it; this
+-- trigger makes sure nothing can bypass it.
+CREATE OR REPLACE FUNCTION voucher_no_not_in_other_table()
+RETURNS TRIGGER LANGUAGE plpgsql SET search_path = public AS $$
+BEGIN
+    IF TG_TABLE_NAME = 'trip_vouchers' AND EXISTS (SELECT 1 FROM terminal_vouchers WHERE voucher_no = NEW.voucher_no)
+       OR TG_TABLE_NAME = 'terminal_vouchers' AND EXISTS (SELECT 1 FROM trip_vouchers WHERE voucher_no = NEW.voucher_no) THEN
+        RAISE EXCEPTION 'Voucher number % is already used', NEW.voucher_no;
+    END IF;
+    RETURN NEW;
+END;
+$$;
+DROP TRIGGER IF EXISTS trip_vouchers_no_unique_all ON trip_vouchers;
+CREATE TRIGGER trip_vouchers_no_unique_all AFTER INSERT ON trip_vouchers FOR EACH ROW EXECUTE FUNCTION voucher_no_not_in_other_table();
+DROP TRIGGER IF EXISTS terminal_vouchers_no_unique_all ON terminal_vouchers;
+CREATE TRIGGER terminal_vouchers_no_unique_all AFTER INSERT ON terminal_vouchers FOR EACH ROW EXECUTE FUNCTION voucher_no_not_in_other_table();
+
+CREATE TABLE IF NOT EXISTS trip_voucher_lines (          -- seats and fares per destination
+    id                   BIGSERIAL PRIMARY KEY,
+    voucher_id           BIGINT NOT NULL REFERENCES trip_vouchers(id) ON DELETE CASCADE,
+    destination_stop_id  INT REFERENCES route_stops(id) ON DELETE SET NULL,
+    destination          VARCHAR(120) NOT NULL,
+    seats                INT NOT NULL CHECK (seats >= 0),
+    free_seats           INT NOT NULL DEFAULT 0 CHECK (free_seats >= 0),
+    fare                 INT NOT NULL CHECK (fare >= 0),
+    sort_order           SMALLINT NOT NULL DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS trip_voucher_lines_voucher_idx ON trip_voucher_lines (voucher_id, sort_order);
+
+CREATE TABLE IF NOT EXISTS trip_voucher_deductions (
+    id           BIGSERIAL PRIMARY KEY,
+    voucher_id   BIGINT NOT NULL REFERENCES trip_vouchers(id) ON DELETE CASCADE,
+    category_id  INT REFERENCES onroute_categories(id) ON DELETE SET NULL,
+    name         VARCHAR(60) NOT NULL,
+    amount       INT NOT NULL CHECK (amount >= 0)
+);
+CREATE INDEX IF NOT EXISTS trip_voucher_deductions_voucher_idx ON trip_voucher_deductions (voucher_id);
+
+CREATE TABLE IF NOT EXISTS trip_voucher_passengers (     -- the passengers linked to the voucher when it was made
+    id           BIGSERIAL PRIMARY KEY,
+    voucher_id   BIGINT NOT NULL REFERENCES trip_vouchers(id) ON DELETE CASCADE,
+    ticket_id    UUID REFERENCES tickets(id) ON DELETE SET NULL,
+    seat_number  VARCHAR(6) NOT NULL,
+    name         VARCHAR(120) NOT NULL,
+    gender       VARCHAR(6),
+    destination  VARCHAR(120) NOT NULL,
+    fare         INT NOT NULL DEFAULT 0,
+    paid_by      VARCHAR(20),
+    is_free      BOOLEAN NOT NULL DEFAULT FALSE
+);
+CREATE INDEX IF NOT EXISTS trip_voucher_passengers_voucher_idx ON trip_voucher_passengers (voucher_id);
+
+-- ---------------------------------------------------------------------------------------------------------------
+-- 6. Security: only the backend (table owner) reads and writes these tables.
+-- ---------------------------------------------------------------------------------------------------------------
+DO $$
+DECLARE t TEXT;
+BEGIN
+    FOREACH t IN ARRAY ARRAY['conductors','staff_directory','terminal_deductions','trip_vouchers','trip_voucher_lines',
+                             'trip_voucher_deductions','trip_voucher_passengers']
+    LOOP
+        EXECUTE format('ALTER TABLE %I ENABLE ROW LEVEL SECURITY', t);
+        EXECUTE format('REVOKE ALL ON %I FROM anon, authenticated', t);
+    END LOOP;
+END $$;
+REVOKE ALL ON FUNCTION voucher_no_not_in_other_table() FROM anon, authenticated, public;
+
+DROP TRIGGER IF EXISTS conductors_set_updated_at ON conductors;
+CREATE TRIGGER conductors_set_updated_at BEFORE UPDATE ON conductors FOR EACH ROW EXECUTE FUNCTION set_updated_at();
+DROP TRIGGER IF EXISTS staff_directory_set_updated_at ON staff_directory;
+CREATE TRIGGER staff_directory_set_updated_at BEFORE UPDATE ON staff_directory FOR EACH ROW EXECUTE FUNCTION set_updated_at();
+
+-- ---------------------------------------------------------------------------------------------------------------
+-- 7. Starting lists
+-- ---------------------------------------------------------------------------------------------------------------
+-- Deduction names used by terminals (added to the on-route list if missing).
+INSERT INTO onroute_categories (name, sort_order) VALUES ('Loader', 7), ('Cleaner', 8)
+ON CONFLICT DO NOTHING;
+
+-- E-tag / toll tax is entered by hand after the trip (meeting, 33): no longer an automatic off-route line.
+UPDATE offroute_categories SET is_active = FALSE WHERE lower(name) = 'e-tag / toll tax' AND is_active;
+
+-- ---------------------------------------------------------------------
+-- 21. ROUND TRIP REPORTS FROM TRIPS AND VOUCHERS (same as db/migrations/2026-11-11-round-trip-from-vouchers.sql)
+-- ---------------------------------------------------------------------
+ALTER TABLE round_trip_legs ADD COLUMN IF NOT EXISTS trip_id BIGINT REFERENCES trips(id) ON DELETE SET NULL;
+CREATE UNIQUE INDEX IF NOT EXISTS round_trip_legs_trip_uq ON round_trip_legs (trip_id) WHERE trip_id IS NOT NULL;
+
+ALTER TABLE terminal_vouchers ADD COLUMN IF NOT EXISTS trip_voucher_id BIGINT REFERENCES trip_vouchers(id) ON DELETE RESTRICT;
+ALTER TABLE terminal_vouchers ADD COLUMN IF NOT EXISTS synced_at TIMESTAMPTZ;
+ALTER TABLE terminal_vouchers ADD COLUMN IF NOT EXISTS edited_after_sync BOOLEAN NOT NULL DEFAULT FALSE;
+CREATE UNIQUE INDEX IF NOT EXISTS terminal_vouchers_trip_voucher_uq ON terminal_vouchers (trip_voucher_id) WHERE trip_voucher_id IS NOT NULL;
+
+-- A copied row has no number of its own (it shows its terminal voucher's number).
+ALTER TABLE terminal_vouchers ALTER COLUMN voucher_no DROP NOT NULL;
+ALTER TABLE terminal_vouchers DROP CONSTRAINT IF EXISTS terminal_vouchers_no_or_link;
+ALTER TABLE terminal_vouchers ADD CONSTRAINT terminal_vouchers_no_or_link CHECK (voucher_no IS NOT NULL OR trip_voucher_id IS NOT NULL);
+
+CREATE OR REPLACE FUNCTION set_report_voucher_no()
+RETURNS TRIGGER LANGUAGE plpgsql SET search_path = public AS $$
+BEGIN
+    IF NEW.trip_voucher_id IS NULL THEN
+        NEW.voucher_no := next_voucher_no();   -- typed in by hand: its own number from the series
+    ELSE
+        NEW.voucher_no := NULL;                -- copied from a terminal voucher: uses that voucher's number
+    END IF;
+    RETURN NEW;
+END;
+$$;
+REVOKE ALL ON FUNCTION set_report_voucher_no() FROM anon, authenticated, public;
+DROP TRIGGER IF EXISTS terminal_vouchers_set_no ON terminal_vouchers;
+CREATE TRIGGER terminal_vouchers_set_no BEFORE INSERT ON terminal_vouchers FOR EACH ROW EXECUTE FUNCTION set_report_voucher_no();
+
+-- ---------------------------------------------------------------------
+-- 22. ORIGIN TERMINALS, AUTOMATIC ROUND TRIP REPORTS (same as db/migrations/2026-11-12-origin-terminals-auto-reports.sql)
+-- ---------------------------------------------------------------------
+ALTER TABLE terminals ADD COLUMN IF NOT EXISTS is_origin BOOLEAN NOT NULL DEFAULT FALSE;
+UPDATE terminals t SET is_origin = TRUE
+FROM cities c
+WHERE c.id = t.city_id AND lower(c.name) IN ('lahore', 'multan') AND NOT t.is_origin;
+
+ALTER TABLE round_trips ADD COLUMN IF NOT EXISTS auto_created BOOLEAN NOT NULL DEFAULT FALSE;
+
+-- ---------------------------------------------------------------------
+-- 23. EMPLOYEES (same as db/migrations/2026-11-13-employees.sql)
+-- ---------------------------------------------------------------------
+-- ---------------------------------------------------------------------------------------------------------------
+-- 1. Lists
+-- ---------------------------------------------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS departments (
+    id          SERIAL PRIMARY KEY,
+    name        VARCHAR(60) NOT NULL,
+    sort_order  SMALLINT NOT NULL DEFAULT 0,
+    is_active   BOOLEAN NOT NULL DEFAULT TRUE
+);
+CREATE UNIQUE INDEX IF NOT EXISTS departments_name_uq ON departments (lower(name));
+
+-- crew: where the system uses people of this designation (Bus & crew, round trip reports).
+-- suggested_role: the login role offered when an account is linked (the admin decides).
+CREATE TABLE IF NOT EXISTS designations (
+    id              SERIAL PRIMARY KEY,
+    name            VARCHAR(60) NOT NULL,
+    crew            VARCHAR(12),
+    suggested_role  VARCHAR(20),
+    sort_order      SMALLINT NOT NULL DEFAULT 0,
+    is_active       BOOLEAN NOT NULL DEFAULT TRUE,
+    CONSTRAINT designations_crew_valid CHECK (crew IS NULL OR crew IN ('driver', 'conductor', 'hostess', 'cashier'))
+);
+CREATE UNIQUE INDEX IF NOT EXISTS designations_name_uq ON designations (lower(name));
+
+CREATE TABLE IF NOT EXISTS licence_types (
+    id          SERIAL PRIMARY KEY,
+    name        VARCHAR(60) NOT NULL,
+    sort_order  SMALLINT NOT NULL DEFAULT 0,
+    is_active   BOOLEAN NOT NULL DEFAULT TRUE
+);
+CREATE UNIQUE INDEX IF NOT EXISTS licence_types_name_uq ON licence_types (lower(name));
+
+CREATE TABLE IF NOT EXISTS licence_authorities (
+    id          SERIAL PRIMARY KEY,
+    name        VARCHAR(80) NOT NULL,
+    sort_order  SMALLINT NOT NULL DEFAULT 0,
+    is_active   BOOLEAN NOT NULL DEFAULT TRUE
+);
+CREATE UNIQUE INDEX IF NOT EXISTS licence_authorities_name_uq ON licence_authorities (lower(name));
+
+INSERT INTO departments (name, sort_order) VALUES ('Operational Staff', 1) ON CONFLICT DO NOTHING;
+
+INSERT INTO designations (name, crew, suggested_role, sort_order) VALUES
+    ('GM', NULL, 'manager', 1),
+    ('AGM', NULL, 'manager', 2),
+    ('Stand Manager (SM)', NULL, 'manager', 3),
+    ('ASM', NULL, 'manager', 4),
+    ('Booking Officer', NULL, 'agent', 5),
+    ('Loader', NULL, NULL, 6),
+    ('Driver', 'driver', 'driver', 7),
+    ('Conductor / Fare Collector', 'conductor', 'conductor', 8),
+    ('Hostess', 'hostess', NULL, 9),
+    ('Cashier', 'cashier', 'agent', 10)
+ON CONFLICT DO NOTHING;
+
+INSERT INTO licence_types (name, sort_order) VALUES
+    ('HPSV (Heavy Passenger Service Vehicle)', 1), ('HTV (Heavy Transport Vehicle)', 2),
+    ('LPSV (Light Passenger Service Vehicle)', 3), ('LTV (Light Transport Vehicle)', 4),
+    ('Motor Car / Jeep', 5), ('Other', 6)
+ON CONFLICT DO NOTHING;
+
+INSERT INTO licence_authorities (name, sort_order) VALUES
+    ('Punjab (DLIMS / Traffic Police)', 1), ('Islamabad (ITP)', 2), ('Sindh', 3), ('Khyber Pakhtunkhwa', 4),
+    ('Balochistan', 5), ('Gilgit-Baltistan', 6), ('Azad Jammu & Kashmir', 7), ('Motorway Police (NHMP)', 8), ('Other', 9)
+ON CONFLICT DO NOTHING;
+
+-- ---------------------------------------------------------------------------------------------------------------
+-- 2. Employees
+-- ---------------------------------------------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS employee_counter (
+    id       SMALLINT PRIMARY KEY CHECK (id = 1),
+    last_no  INT NOT NULL CHECK (last_no < 99999)
+);
+INSERT INTO employee_counter (id, last_no) VALUES (1, 0) ON CONFLICT (id) DO NOTHING;
+
+/** Next employee ID. The counter row stays locked until the saving transaction ends: unique, and a cancelled save
+    gives its number back, so opening and closing the form never uses one up. */
+CREATE OR REPLACE FUNCTION next_employee_code()
+RETURNS TEXT LANGUAGE sql VOLATILE SET search_path = public AS $$
+    UPDATE employee_counter SET last_no = last_no + 1 WHERE id = 1 RETURNING 'NK-' || lpad(last_no::TEXT, 5, '0');
+$$;
+
+CREATE TABLE IF NOT EXISTS employees (
+    id                  SERIAL PRIMARY KEY,
+    employee_code       VARCHAR(10) NOT NULL,
+    full_name           VARCHAR(120) NOT NULL,
+    department_id       INT REFERENCES departments(id) ON DELETE SET NULL,
+    designation_id      INT REFERENCES designations(id) ON DELETE SET NULL,
+    joining_date        DATE,
+    cnic                VARCHAR(15),
+    cnic_expiry         DATE,
+    marital_status      VARCHAR(10),
+    current_address     VARCHAR(300),
+    permanent_address   VARCHAR(300),
+    city                VARCHAR(80),
+    phone               VARCHAR(20),
+    blood_group         VARCHAR(3),
+    licence_no          VARCHAR(40),
+    licence_type_id     INT REFERENCES licence_types(id) ON DELETE SET NULL,
+    licence_expiry      DATE,
+    licence_authority   VARCHAR(80),
+    notes               VARCHAR(1000),
+    user_id             UUID REFERENCES users(id) ON DELETE SET NULL,      -- their login, if they have one
+    is_active           BOOLEAN NOT NULL DEFAULT TRUE,
+    left_on             DATE,
+    created_by          UUID REFERENCES users(id) ON DELETE SET NULL,
+    created_at          TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at          TIMESTAMPTZ NOT NULL DEFAULT now(),
+    CONSTRAINT employees_code_uq UNIQUE (employee_code),
+    CONSTRAINT employees_code_format CHECK (employee_code ~ '^NK-[0-9]{5}$'),
+    CONSTRAINT employees_marital_valid CHECK (marital_status IS NULL OR marital_status IN ('single', 'married', 'widowed', 'divorced')),
+    CONSTRAINT employees_blood_valid CHECK (blood_group IS NULL OR blood_group IN ('A+', 'A-', 'B+', 'B-', 'AB+', 'AB-', 'O+', 'O-'))
+);
+CREATE UNIQUE INDEX IF NOT EXISTS employees_cnic_uq ON employees (cnic) WHERE cnic IS NOT NULL;
+CREATE UNIQUE INDEX IF NOT EXISTS employees_user_uq ON employees (user_id) WHERE user_id IS NOT NULL;
+CREATE INDEX IF NOT EXISTS employees_name_idx ON employees (lower(full_name));
+CREATE INDEX IF NOT EXISTS employees_designation_idx ON employees (designation_id, is_active);
+
+CREATE OR REPLACE FUNCTION set_employee_code()
+RETURNS TRIGGER LANGUAGE plpgsql SET search_path = public AS $$
+BEGIN
+    NEW.employee_code := next_employee_code();   -- always system-generated
+    RETURN NEW;
+END;
+$$;
+DROP TRIGGER IF EXISTS employees_set_code ON employees;
+CREATE TRIGGER employees_set_code BEFORE INSERT ON employees FOR EACH ROW EXECUTE FUNCTION set_employee_code();
+
+CREATE OR REPLACE FUNCTION keep_employee_code()
+RETURNS TRIGGER LANGUAGE plpgsql SET search_path = public AS $$
+BEGIN
+    IF NEW.employee_code IS DISTINCT FROM OLD.employee_code THEN
+        RAISE EXCEPTION 'An employee ID cannot be changed';
+    END IF;
+    RETURN NEW;
+END;
+$$;
+DROP TRIGGER IF EXISTS employees_keep_code ON employees;
+CREATE TRIGGER employees_keep_code BEFORE UPDATE OF employee_code ON employees FOR EACH ROW EXECUTE FUNCTION keep_employee_code();
+
+DROP TRIGGER IF EXISTS employees_set_updated_at ON employees;
+CREATE TRIGGER employees_set_updated_at BEFORE UPDATE ON employees FOR EACH ROW EXECUTE FUNCTION set_updated_at();
+
+-- Drivers and conductors used by trips, linked to their employee.
+ALTER TABLE drivers ADD COLUMN IF NOT EXISTS employee_id INT REFERENCES employees(id) ON DELETE SET NULL;
+ALTER TABLE conductors ADD COLUMN IF NOT EXISTS employee_id INT REFERENCES employees(id) ON DELETE SET NULL;
+CREATE UNIQUE INDEX IF NOT EXISTS drivers_employee_uq ON drivers (employee_id) WHERE employee_id IS NOT NULL;
+CREATE UNIQUE INDEX IF NOT EXISTS conductors_employee_uq ON conductors (employee_id) WHERE employee_id IS NOT NULL;
+
+-- ---------------------------------------------------------------------------------------------------------------
+-- 3. Existing drivers, conductors and staff directory become employees (each once).
+-- ---------------------------------------------------------------------------------------------------------------
+DO $$
+DECLARE
+    r        RECORD;
+    v_id     INT;
+    v_dept   INT := (SELECT id FROM departments WHERE lower(name) = 'operational staff');
+    v_cnic   TEXT;
+    v_note   TEXT;
+BEGIN
+    FOR r IN SELECT * FROM drivers WHERE employee_id IS NULL ORDER BY id LOOP
+        v_cnic := r.cnic; v_note := 'Moved from the Drivers list.';
+        IF v_cnic IS NOT NULL AND EXISTS (SELECT 1 FROM employees WHERE cnic = v_cnic) THEN
+            v_note := v_note || ' CNIC ' || v_cnic || ' is already on another employee: please check.'; v_cnic := NULL;
+        END IF;
+        INSERT INTO employees (employee_code, full_name, department_id, designation_id, cnic, phone, licence_no, licence_expiry,
+                               licence_type_id, is_active, notes)
+        VALUES ('NK-00000', r.full_name, v_dept, (SELECT id FROM designations WHERE name = 'Driver'), v_cnic, r.phone, r.license_no,
+                r.license_expiry, (SELECT id FROM licence_types WHERE name LIKE 'HPSV%'), r.is_active, v_note)
+        RETURNING id INTO v_id;
+        UPDATE drivers SET employee_id = v_id WHERE id = r.id;
+    END LOOP;
+
+    FOR r IN SELECT * FROM conductors WHERE employee_id IS NULL ORDER BY id LOOP
+        v_cnic := r.cnic; v_note := 'Moved from the Conductors list.';
+        IF v_cnic IS NOT NULL AND EXISTS (SELECT 1 FROM employees WHERE cnic = v_cnic) THEN
+            v_note := v_note || ' CNIC ' || v_cnic || ' is already on another employee: please check.'; v_cnic := NULL;
+        END IF;
+        INSERT INTO employees (employee_code, full_name, department_id, designation_id, cnic, phone, user_id, is_active, notes)
+        VALUES ('NK-00000', r.full_name, v_dept, (SELECT id FROM designations WHERE name = 'Conductor / Fare Collector'), v_cnic, r.phone,
+                CASE WHEN r.user_id IS NOT NULL AND NOT EXISTS (SELECT 1 FROM employees WHERE user_id = r.user_id) THEN r.user_id END,
+                r.is_active, v_note)
+        RETURNING id INTO v_id;
+        UPDATE conductors SET employee_id = v_id WHERE id = r.id;
+    END LOOP;
+
+    -- Staff directory (cleaners, loaders...): loaders keep their designation, others are noted for HR to set.
+    FOR r IN SELECT * FROM staff_directory s
+             WHERE NOT EXISTS (SELECT 1 FROM employees e WHERE e.notes LIKE '%[staff directory #' || s.id || ']%') ORDER BY id LOOP
+        v_cnic := r.cnic;
+        IF v_cnic IS NOT NULL AND EXISTS (SELECT 1 FROM employees WHERE cnic = v_cnic) THEN v_cnic := NULL; END IF;
+        INSERT INTO employees (employee_code, full_name, department_id, designation_id, cnic, phone, is_active, notes)
+        VALUES ('NK-00000', r.full_name, v_dept, CASE WHEN r.job = 'loader' THEN (SELECT id FROM designations WHERE name = 'Loader') END,
+                v_cnic, r.phone, r.is_active,
+                'Moved from the Staff directory (job: ' || r.job || ') [staff directory #' || r.id || '].' || COALESCE(' ' || r.notes, ''));
+    END LOOP;
+END $$;
+
+-- ---------------------------------------------------------------------------------------------------------------
+-- 4. Security: only the backend reads and writes these tables.
+-- ---------------------------------------------------------------------------------------------------------------
+DO $$
+DECLARE t TEXT;
+BEGIN
+    FOREACH t IN ARRAY ARRAY['departments','designations','licence_types','licence_authorities','employee_counter','employees'] LOOP
+        EXECUTE format('ALTER TABLE %I ENABLE ROW LEVEL SECURITY', t);
+        EXECUTE format('REVOKE ALL ON %I FROM anon, authenticated', t);
+    END LOOP;
+END $$;
+REVOKE ALL ON FUNCTION next_employee_code() FROM anon, authenticated, public;
+
+-- ---------------------------------------------------------------------
+-- 24. DAY PLANS (same as db/migrations/2026-11-14-day-plans.sql)
+-- ---------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS day_plans (
+    plan_date          DATE PRIMARY KEY,
+    version            INT NOT NULL DEFAULT 1 CHECK (version > 0),
+    published_at       TIMESTAMPTZ NOT NULL DEFAULT now(),
+    published_by       UUID REFERENCES users(id) ON DELETE SET NULL,
+    published_by_name  VARCHAR(120) NOT NULL,
+    snapshot           JSONB NOT NULL DEFAULT '[]'::jsonb
+);
+ALTER TABLE day_plans ENABLE ROW LEVEL SECURITY;
+REVOKE ALL ON day_plans FROM anon, authenticated;
 
 COMMIT;
 

@@ -39,6 +39,11 @@ function fromPg(err) {
       return new AppError(503, 'The system is busy, please retry.', 'RETRY');
     case '57014':
       return new AppError(503, 'The request took too long, please retry.', 'TIMEOUT');
+    case '42P01': // undefined table
+    case '42703': // undefined column
+    case '42883': // undefined function
+      // The code is newer than the database: a file in db/migrations has not been run yet (logged in full).
+      return new AppError(503, 'The database is missing an update. Run the newest files in backend/db/migrations.', 'DB_MIGRATION_MISSING');
     default:
       return null;
   }
