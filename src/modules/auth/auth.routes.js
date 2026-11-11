@@ -23,6 +23,13 @@ const sessionPayload = (session, user) => ({
 // Generic messages: never reveal whether an account exists.
 const INVALID_LOGIN = 'Invalid email or password';
 
+const accountExists = () =>
+  new AppError(
+    409,
+    'An account with this email already exists. Sign in, or if you have not verified your email yet, press "Verify now" to get a new link.',
+    'ACCOUNT_EXISTS',
+  );
+
 const signupSchema = z
   .object({
     fullName: personName,
@@ -54,8 +61,12 @@ router.post('/signup', authLimiter, validate({ body: signupSchema }), async (req
       throw AppError.badRequest('That password is too weak. Use at least 8 characters with upper-case, lower-case and a number.');
     }
     if (error.code === 'email_address_invalid') throw AppError.badRequest('That email address cannot be used. Please check it.');
+    if (error.code === 'user_already_exists' || error.code === 'email_exists') throw accountExists();
     throw AppError.badRequest('Unable to create account. The email may already be registered or the password is too weak.');
   }
+
+  // Email already registered and confirmed: Supabase answers with a placeholder user that has no identities.
+  if (data.user && Array.isArray(data.user.identities) && data.user.identities.length === 0) throw accountExists();
 
   if (data.user) {
     // The profile row is created by the auth trigger. Phone is stored unverified, for booking contact purposes.
@@ -77,6 +88,10 @@ router.post(
   validate({ body: z.object({ email, password: z.string().min(1).max(72) }).strict() }),
   async (req, res) => {
     const { data, error } = await supabasePublic().auth.signInWithPassword(req.valid.body);
+    // Supabase only says "not confirmed" once the password is right, so this reveals nothing to a stranger.
+    if (error?.code === 'email_not_confirmed') {
+      throw new AppError(403, 'Your email is not verified yet. Press "Verify now" to get a new verification link.', 'EMAIL_NOT_CONFIRMED');
+    }
     if (error || !data.session) throw AppError.unauthorized(INVALID_LOGIN);
     res.json(sessionPayload(data.session, data.user));
   },
@@ -129,6 +144,28 @@ router.post('/logout', requireAuth, async (req, res) => {
   if (error) req.log.warn({ code: error.code }, 'logout failed');
   res.json({ message: 'Logged out' });
 });
+
+/** Send the account-confirmation email again (the first one was lost, expired, or never opened). */
+router.post(
+  '/resend-confirmation',
+  otpLimiter,
+  validate({ body: z.object({ email }).strict() }),
+  async (req, res) => {
+    const { error } = await supabasePublic().auth.resend({
+      type: 'signup',
+      email: req.valid.body.email,
+      options: { emailRedirectTo: env.AUTH_REDIRECT_URL },
+    });
+    if (error) {
+      req.log.warn({ code: error.code, status: error.status }, 'resend confirmation failed');
+      if (error.code === 'over_email_send_rate_limit' || error.status === 429) {
+        throw new AppError(429, 'Too many emails were sent in a short time. Please wait a few minutes and try again.', 'TOO_MANY_EMAILS');
+      }
+    }
+    // Same answer otherwise, so it never reveals whether an account exists.
+    res.json({ message: 'If this email has an account that is not verified yet, a new verification link has been sent.' });
+  },
+);
 
 router.post(
   '/password/forgot',
