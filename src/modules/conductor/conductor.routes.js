@@ -127,7 +127,7 @@ router.post(
         seatId: intId,
         name: personName,
         gender,
-        phone: phone.optional(),
+        phone, // required
         destinationStopId: intId,
         fare: z.number().int().min(0).max(100_000),
         free: z.boolean().default(false),
@@ -159,14 +159,14 @@ router.post(
         `INSERT INTO bookings (trip_id, boarding_stop_id, dropping_stop_id, contact_name, contact_phone, channel, booked_by_agent_id,
                                subtotal, discount_amount, currency, notes)
          VALUES ($1, $2, $3, $4, $5, 'on_road', $6, $7, 0, 'PKR', $8) RETURNING id, pnr`,
-        [tripId, from.id, to.id, b.name, b.phone ?? '-', req.user.id, fare, b.free ? 'Road passenger, travelled free' : 'Road passenger'],
+        [tripId, from.id, to.id, b.name, b.phone, req.user.id, fare, b.free ? 'Road passenger, travelled free' : 'Road passenger'],
         client,
       );
       // Seat rules (bus, bookable, side-by-side gender rule) are checked by the ticket triggers.
       const ticket = await one(
         `INSERT INTO tickets (booking_id, trip_id, seat_id, passenger_name, passenger_gender, passenger_phone, fare_amount, status, is_free, added_by)
          VALUES ($1, $2, $3, $4, $5, $6, $7, 'held', $8, $9) RETURNING id`,
-        [booking.id, tripId, b.seatId, b.name, b.gender, b.phone ?? null, fare, b.free, req.user.id],
+        [booking.id, tripId, b.seatId, b.name, b.gender, b.phone, fare, b.free, req.user.id],
         client,
       );
       if (fare > 0) {

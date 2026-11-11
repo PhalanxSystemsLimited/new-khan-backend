@@ -61,7 +61,7 @@ const passengerSchema = z
     gender,
     age: z.number().int().min(0).max(120).optional(),
     cnic: cnic.optional(),
-    phone: phone.optional(),
+    phone, // every passenger's mobile number is required
   })
   .strict();
 

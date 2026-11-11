@@ -136,15 +136,15 @@ export async function createBooking(user, input) {
     // Booking holder's CNIC. Customer: their account's CNIC, always; an account without one (made before CNICs
     // were asked for, or by phone code) gets the one typed now, saved for every later booking. Staff: the
     // walk-in customer's CNIC they typed.
-    let holderCnic;
+    // The CNIC is optional (many passengers are picked up locally or on the road). Without one, a counter refund
+    // is confirmed with a code sent by SMS to the booking's phone instead.
+    let holderCnic = null;
     if (staff) {
-      if (!input.holderCnic) throw AppError.badRequest("Enter the customer's CNIC.");
-      holderCnic = cnicDigits(input.holderCnic);
+      if (input.holderCnic) holderCnic = cnicDigits(input.holderCnic);
     } else {
       const acct = await one(`SELECT cnic FROM users WHERE id = $1 FOR UPDATE`, [user.id], client);
       if (acct?.cnic) holderCnic = cnicDigits(acct.cnic);
-      else {
-        if (!input.holderCnic) throw AppError.badRequest('Enter your CNIC. It is saved to your account for every booking.');
+      else if (input.holderCnic) {
         holderCnic = cnicDigits(input.holderCnic);
         await client.query(`UPDATE users SET cnic = $2 WHERE id = $1`, [user.id, cnicDisplay(holderCnic)]);
       }

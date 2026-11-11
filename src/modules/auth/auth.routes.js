@@ -28,9 +28,9 @@ const signupSchema = z
     fullName: personName,
     email,
     password,
-    phone: phone.optional(),
-    // The account holder's CNIC: every booking made with this account carries it (checked for counter refunds).
-    cnic,
+    phone, // required
+    // Optional. When given, every booking made with this account carries it (checked for counter refunds).
+    cnic: cnic.optional(),
   })
   .strict();
 
@@ -51,8 +51,8 @@ router.post('/signup', authLimiter, validate({ body: signupSchema }), async (req
 
   if (data.user) {
     // The profile row is created by the auth trigger. Phone is stored unverified, for booking contact purposes.
-    if (tel) await one(`UPDATE users SET phone = $2 WHERE id = $1 AND phone IS NULL`, [data.user.id, tel]).catch(() => {});
-    await one(`UPDATE users SET cnic = $2 WHERE id = $1 AND cnic IS NULL`, [data.user.id, cnicDisplay(id)]).catch(() => {});
+    await one(`UPDATE users SET phone = $2 WHERE id = $1 AND phone IS NULL`, [data.user.id, tel]).catch(() => {});
+    if (id) await one(`UPDATE users SET cnic = $2 WHERE id = $1 AND cnic IS NULL`, [data.user.id, cnicDisplay(id)]).catch(() => {});
   }
 
   res.status(201).json({
