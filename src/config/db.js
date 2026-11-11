@@ -13,6 +13,8 @@ pg.types.setTypeParser(1082, (v) => v);
 
 function sslConfig() {
   if (!env.DB_SSL) return false;
+  // Certificate given as text (Vercel). A one-line value may write line breaks as the two characters \n.
+  if (env.DB_SSL_CA) return { ca: env.DB_SSL_CA.replace(/\\n/g, '\n'), rejectUnauthorized: true };
   if (env.DB_SSL_CA_PATH) {
     return { ca: fs.readFileSync(env.DB_SSL_CA_PATH, 'utf8'), rejectUnauthorized: true };
   }

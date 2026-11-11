@@ -178,6 +178,48 @@ Put Nginx in front with HTTPS (Let's Encrypt), proxying to `PORT`. Keep `TRUST_P
 
 Entry file `src/server.js`, Node 20+, and add every variable from `.env.example` in the panel.
 
+### Vercel (for live testing; moving to Hostinger later needs no code change)
+
+The same code runs on both. On Hostinger `src/server.js` starts the server and the minute job; on Vercel
+`api/index.js` hands the same Express app to Vercel (`vercel.json` sends every path to it) and the minute job is
+replaced by a scheduled call. Two Vercel projects from the same repository:
+
+| Project | Root Directory | What it uses |
+|---|---|---|
+| Website + admin panel | `frontend` | `frontend/vercel.json` (all pages open the app) |
+| API | `backend` | `backend/vercel.json`, `backend/api/index.js` |
+
+**API project, environment variables** (Settings → Environment Variables): everything from `.env`, with these
+differences:
+
+- `DATABASE_URL`: the Supabase **transaction pooler** URL (port **6543**) is best for serverless; the session
+  pooler (5432) also works. `DB_POOL_MAX=3` (many small instances instead of one big one).
+- `DB_SSL_CA`: paste the contents of `certs/supabase-ca.crt` (instead of `DB_SSL_CA_PATH`, a path on your PC).
+  `DB_SSL_CA_PATH=certs/supabase-ca.crt` also works, since `vercel.json` ships the `certs` folder.
+- `CRON_SECRET`: any long random text. `NODEJS_HELPERS=0` (Vercel then passes requests to Express untouched, like
+  a normal server: needed for the payment webhook signature).
+- `CORS_ORIGINS`, `APP_URL`: the website project's address, e.g. `https://new-khan.vercel.app`.
+  `API_PUBLIC_URL`: this project's address (Safepay return links).
+
+**Website project, environment variables:** `VITE_API_MODE=live`, `VITE_API_URL=https://<api-project>.vercel.app/api/v1`.
+Supabase → Authentication → URL Configuration: add the website address (site URL and redirect URLs).
+
+**Releasing unpaid seat holds on Vercel.** There is no process running between requests, so:
+1. Trip search and seat maps release expired holds as they load (at most every 30 s per instance), so customers
+   and counter staff always see freed seats.
+2. Vercel Cron calls `GET /api/v1/internal/expire-bookings` (with `CRON_SECRET`). On the Hobby plan Vercel allows
+   only one run a day (`vercel.json` is set to that); on Pro change the schedule to `* * * * *`. For every minute
+   on any plan, either have a free scheduler (e.g. cron-job.org) call that URL with the header
+   `Authorization: Bearer <CRON_SECRET>`, or let the database do it: enable **pg_cron** (Supabase → Database →
+   Extensions) and run once
+   `select cron.schedule('expire-bookings', '* * * * *', 'select public.expire_stale_bookings()');`
+
+**Moving to Hostinger later:** delete the two Vercel projects; deploy `backend` as above (PM2, entry
+`src/server.js`) with your normal `.env` (`DB_SSL_CA_PATH`, session pooler, `DB_POOL_MAX=10`, no `CRON_SECRET`);
+build `frontend` with `npm run build` and serve `frontend/dist` with every page falling back to `index.html`
+(Nginx: `try_files $uri /index.html;`). The files `vercel.json` and `api/index.js` are simply unused there.
+If pg_cron was enabled it can stay: running the release twice is harmless.
+
 ### Production checklist
 
 - [ ] `NODE_ENV=production`, real `CORS_ORIGINS`, `APP_URL`, `API_PUBLIC_URL` (https)

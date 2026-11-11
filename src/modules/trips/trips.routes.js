@@ -5,6 +5,7 @@ import { validate } from '../../middleware/validate.js';
 import { optionalAuth, requireAuth, requireRole, isStaff, ADMIN_ROLES, MANAGER_ROLES, STAFF_ROLES } from '../../middleware/auth.js';
 import { env } from '../../config/env.js';
 import { autoCreateReport, closePreviousRoundTrip } from '../roundtrips/roundtrips.sync.js';
+import { expireStaleSoon } from '../../jobs/expireBookings.js';
 import { searchLimiter } from '../../middleware/rateLimit.js';
 import { AppError } from '../../utils/AppError.js';
 import { audit } from '../../utils/audit.js';
@@ -41,6 +42,7 @@ const searchSchema = z
 router.get('/search', searchLimiter, optionalAuth, validate({ query: searchSchema }), async (req, res) => {
   const q = req.valid.query;
   const staffView = isStaff(req.user);
+  await expireStaleSoon(); // free seats whose unpaid hold has run out (serverless hosts have no minute job)
   const { rows } = await query(
     `SELECT t.id AS trip_id, r.code AS route_code, r.name AS route_name, b.bus_class, b.amenities,
             bs.id AS boarding_stop_id, bt.name AS boarding_terminal,
@@ -117,6 +119,7 @@ router.get('/:id', validate({ params: bigIdParam }), async (req, res) => {
 router.get('/:id/seats', searchLimiter, validate({ params: bigIdParam }), async (req, res) => {
   const exists = await one(`SELECT id FROM trips WHERE id = $1`, [req.valid.params.id]);
   if (!exists) throw AppError.notFound('Trip not found');
+  await expireStaleSoon();
   const { rows } = await query(
     `SELECT seat_id, seat_number, row_no, col_no, deck, kind,
             CASE WHEN seat_status IN ('held','reserved','confirmed','boarded') THEN 'booked' ELSE seat_status END AS status,

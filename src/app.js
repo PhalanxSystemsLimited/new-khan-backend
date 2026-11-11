@@ -31,6 +31,7 @@ import conductorRoutes from './modules/conductor/conductor.routes.js';
 import { adminEmployeesRouter, crewRouter } from './modules/employees/employees.routes.js';
 import { dayPlanRouter } from './modules/dayplan/dayPlan.routes.js';
 import { homeRouter } from './modules/home/home.routes.js';
+import { runExpiryOnce } from './jobs/expireBookings.js';
 
 export function createApp() {
   const app = express();
@@ -93,6 +94,19 @@ export function createApp() {
     } catch {
       res.status(503).json({ status: 'degraded' });
     }
+  });
+
+  // ---- Scheduled job for serverless hosts (Vercel Cron, or any scheduler calling it every few minutes) ----
+  // Off unless CRON_SECRET is set; a long-running server runs the same job in-process every minute instead.
+  app.get('/api/v1/internal/expire-bookings', async (req, res) => {
+    if (!env.CRON_SECRET) return res.status(404).json({ error: { code: 'NOT_FOUND', message: 'Not found' } });
+    const sent = Buffer.from(String(req.headers.authorization ?? ''));
+    const want = Buffer.from(`Bearer ${env.CRON_SECRET}`);
+    if (sent.length !== want.length || !crypto.timingSafeEqual(sent, want)) {
+      return res.status(401).json({ error: { code: 'UNAUTHORIZED', message: 'Authentication required' } });
+    }
+    res.set('Cache-Control', 'no-store');
+    res.json({ data: await runExpiryOnce() });
   });
 
   // ---- Payment webhooks need the raw body for signature checks: mount before express.json ----

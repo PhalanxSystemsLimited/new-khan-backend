@@ -22,6 +22,8 @@ const schema = z.object({
   DATABASE_URL: z.string().regex(/^postgres(ql)?:\/\//, 'must be a postgres:// connection string'),
   DB_POOL_MAX: z.coerce.number().int().min(1).max(50).default(10),
   DB_SSL_CA_PATH: z.string().optional().default(''),
+  // The same certificate as text (PEM), for hosts without a file system you control (Vercel). Wins over the path.
+  DB_SSL_CA: z.string().optional().default(''),
   DB_SSL: bool.default('true'),
 
   AUTH_REDIRECT_URL: z.string().url().optional(),
@@ -30,6 +32,10 @@ const schema = z.object({
   // Online booking from a terminal closes this many minutes before the bus is due there (every terminal, delays
   // included). Counter staff keep selling until that terminal's voucher is generated.
   ONLINE_CUTOFF_MINUTES: z.coerce.number().int().min(0).max(720).default(60),
+
+  // Serverless hosts: protects GET /api/v1/internal/expire-bookings (Vercel Cron sends it as a Bearer token).
+  // Leave empty on a long-running server: that endpoint is then off and the in-process minute job does the work.
+  CRON_SECRET: z.union([z.literal(''), z.string().min(16, 'CRON_SECRET must be at least 16 characters')]).optional().default(''),
   MAX_SEATS_PER_BOOKING: z.coerce.number().int().min(1).max(20).default(6),
 
   // Only for the generic relay webhook (non-Safepay methods). Leave unset to disable that webhook.
