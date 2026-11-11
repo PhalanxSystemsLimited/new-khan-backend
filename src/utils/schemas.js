@@ -45,7 +45,10 @@ export const password = z
   .string()
   .min(8, 'Password must be at least 8 characters')
   .max(72, 'Password must be at most 72 characters')
-  .refine((v) => /[a-z]/.test(v) && /[A-Z]/.test(v) && /\d/.test(v), 'Password must contain upper-case, lower-case and a number');
+  .refine(
+    (v) => /[a-z]/.test(v) && /[A-Z]/.test(v) && /\d/.test(v) && /[!@#$%^&*()_+\-=[\]{};':"|<>?,./`~\\]/.test(v),
+    'Password must contain an upper-case letter, a lower-case letter, a number and a special character (e.g. ! @ # $ %)',
+  );
 
 export const cnic = z
   .string()

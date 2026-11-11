@@ -58,7 +58,7 @@ router.post('/signup', authLimiter, validate({ body: signupSchema }), async (req
       throw new AppError(429, 'Too many accounts were created in the last hour. Please try again later, or sign in with a phone code.', 'TOO_MANY_SIGNUPS');
     }
     if (error.code === 'weak_password') {
-      throw AppError.badRequest('That password is too weak. Use at least 8 characters with upper-case, lower-case and a number.');
+      throw AppError.badRequest('That password is too weak. Use at least 8 characters with an upper-case letter, a lower-case letter, a number and a special character.');
     }
     if (error.code === 'email_address_invalid') throw AppError.badRequest('That email address cannot be used. Please check it.');
     if (error.code === 'user_already_exists' || error.code === 'email_exists') throw accountExists();
