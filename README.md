@@ -265,15 +265,19 @@ Rules:
 - No seat is reserved for women. A male and a female passenger from **different bookings** may not sit side by side
   (neighbouring seats on the same side of the aisle, e.g. 1A–1B; across the aisle is fine). A mixed pair in one booking is
   allowed. Enforced by the `tickets_validate_seat_neighbours` trigger (error `SEAT_GENDER`, 409). Passengers are male or female only.
+- **CNIC.** Every new booking needs the booking holder's CNIC, one per booking (a family travels on one CNIC): online,
+  counter sale and the conductor's roadside passenger. Error `CNIC_REQUIRED` (400) without one. Made-up numbers
+  (one digit repeated, leading 0, 12345-6789012-3) are refused everywhere. It stays optional at sign-up.
 - **Refunds.** The amount always comes from the cancellation rules. Every booking stores its holder's CNIC (`holder_cnic`).
   - *Online* (customer cancels online, or the booking was paid online): refund is `requested`; only a **super admin** may
     approve/reject/mark it paid (`PATCH /admin/refunds/:id`), after sending the money back through Safepay.
-  - *Counter* (`POST /bookings/:id/counter-cancel`, any staff role): staff confirm the holder, by CNIC match or, for bookings
-    without a CNIC, a 6-digit SMS code (`POST /bookings/:id/counter-code`). Paid in cash → refunded in cash at once
+  - *Counter* (`POST /bookings/:id/counter-cancel`, any staff role): staff confirm the holder by CNIC match. Bookings made
+    before CNICs were required have none: a **manager or admin** approves the refund themselves, writing how they
+    checked the customer (`identity_check = 'manager'`), or, once SMS is on, a 6-digit code is sent to the booking's
+    phone (`POST /bookings/:id/counter-code`). Other staff get `MANAGER_APPROVAL_REQUIRED` (403). Paid in cash → refunded in cash at once
     (`channel = 'counter'`, `processed`). Paid online → cancelled, refund goes to the super admin as above.
   - `GET /admin/reports/cash`: cash taken and refunded per staff member per day.
-  - **SMS is not connected yet** (`src/utils/sms.js`): in development the code is shown on the staff screen; in production
-    sending a code fails until a provider is added there.
+  - While SMS is off, in development the code is shown on the staff screen; in production only the manager route works.
 - Seat holds/releases are done by DB triggers when the booking status changes (`release_seats_on_booking_end`).
 
 ### 6.3 Expiry of unpaid holds
@@ -401,6 +405,28 @@ Methods without a real provider use the generic relay webhook: body `{ paymentId
 
 Staff call `POST /payments/cash` with the booking id and exact amount; the booking is confirmed immediately.
 
+### 7.7 SMS (off until set up)
+
+For **online bookings only** (Akbar: "SMS only for online booking, not counter"). Nothing is sent, and nothing
+changes for customers, until `SMS_API_URL` is set.
+
+| When SMS is on | What happens |
+|---|---|
+| Customer reserves seats online | The contact mobile must be verified first: `POST /phone/send-code`, then `POST /phone/verify` with the 6-digit code. Asked once per number. Without it, booking answers `PHONE_NOT_VERIFIED` (428) and the website shows the code box. |
+| Online payment succeeds | One SMS: ticket number, route, date and time at the boarding stop, seats. Sent after the payment is saved; a failed SMS never affects the booking. |
+| Counter refund of an old booking with no CNIC | Staff may send a code to the booking's phone instead of asking a manager. |
+
+**To switch it on** (the New Khan team):
+1. Open an account with a Pakistani bulk-SMS provider (Jazz, Zong, Telenor or an aggregator), buy an SMS package and
+   ask them to register the sender name (e.g. `NEWKHAN`). This can take a few days.
+2. Ask the provider for their "send SMS by HTTP API" address and your username / password or API key.
+3. In Vercel → backend project → Settings → Environment Variables, add `SMS_API_URL` (their address, with
+   `{to} {text} {sender} {username} {password}` where the values go), `SMS_USERNAME`, `SMS_PASSWORD`, `SMS_SENDER`,
+   and if needed `SMS_METHOD=POST`, `SMS_PHONE_FORMAT`, `SMS_SUCCESS_TEXT` (see `.env.example`). Redeploy.
+4. Check: `GET /phone/sms-status` (manager/admin) shows `enabled: true`; book online with your own number.
+
+Every message tried is logged in `sms_messages` (number partly hidden, codes never stored).
+
 ---
 
 ## 8. Database
@@ -473,6 +499,7 @@ Access: **public**, **C** = any signed-in user, **owner** = the booking's custom
 | GET/PUT | `/admin/cancellation-policies` | A | Refund rules (hours before departure → % refunded) |
 | GET/PATCH | `/admin/refunds[/:id]` | A | Process refunds |
 | GET | `/admin/reports/daily-revenue` · `/admin/reports/summary` · `/admin/audit-logs` | A | Reporting |
+| GET | `/admin/audit-logs?entityType=&actorId=&from=&to=&q=` · `/admin/audit-logs/meta` · `/admin/audit-logs/:id` | A | Activity log: filters (Pakistan dates; `q` searches PNR, item id, action, person and the saved details), the types and people for the filters, one entry. Each entry includes the person's role and email and a readable item name (`entityLabel`). |
 | GET | `/admin/routes` · `/admin/routes/:id` · `/admin/locations` | A | Lists for the admin panel, including inactive routes, cities, terminals |
 | GET | `/content` | public | Website content saved in the admin panel (`{ key: value }`) |
 | GET · PUT · DELETE | `/admin/content` · `/admin/content/:key` | A | List / save (`{ value }`, up to 1 MB) / reset a content section |
@@ -506,7 +533,7 @@ Quote the `requestId` (also in the `X-Request-Id` response header) when searchin
 
 | Item | Status |
 |---|---|
-| **SMS / email confirmations** | Confirmations are **queued** in the `notifications` table, but **nothing sends them yet**. A sender (e.g. an SMS provider) needs to be built. |
+| **SMS** | Built but **off** until an SMS provider is set up (§7.7). Email confirmations are queued in `notifications` but nothing sends them yet. |
 | **Refund payouts** | Refunds are **recorded** (`refunds`, status `approved`). Money is **not** sent back automatically; staff refund via Safepay's dashboard, then mark the refund `processed` with `PATCH /admin/refunds/:id`. |
 | **Admin panel gaps** | The `/admin` panel covers daily operations, setup, people, reports and website content. Not in it yet: creating new seat layouts (API only), uploading images (use a path or link), editing a booking's passengers. |
 | **Info pages vs booking prices** | Fares/times on the information pages are *website content*; booking prices are the *Fares* table. Admins must keep both in line. |

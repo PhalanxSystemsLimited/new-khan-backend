@@ -13,7 +13,8 @@ import { validate } from '../../middleware/validate.js';
 import { requireAuth, requireRole, EMPLOYEE_ROLES, MANAGER_ROLES } from '../../middleware/auth.js';
 import { AppError } from '../../utils/AppError.js';
 import { audit } from '../../utils/audit.js';
-import { bigIdParam, gender, intId, personName, phone, text, uuid } from '../../utils/schemas.js';
+import { bigIdParam, cnic, gender, intId, personName, phone, text, uuid } from '../../utils/schemas.js';
+import { cnicDigits } from '../../utils/cnic.js';
 import { loadTrip } from '../tripvouchers/tripVouchers.service.js';
 
 const router = Router();
@@ -128,6 +129,7 @@ router.post(
         name: personName,
         gender,
         phone, // required
+        cnic, // required: the counter checks it before any refund
         destinationStopId: intId,
         fare: z.number().int().min(0).max(100_000),
         free: z.boolean().default(false),
@@ -157,9 +159,9 @@ router.post(
       const fare = b.free ? 0 : b.fare;
       const booking = await one(
         `INSERT INTO bookings (trip_id, boarding_stop_id, dropping_stop_id, contact_name, contact_phone, channel, booked_by_agent_id,
-                               subtotal, discount_amount, currency, notes)
-         VALUES ($1, $2, $3, $4, $5, 'on_road', $6, $7, 0, 'PKR', $8) RETURNING id, pnr`,
-        [tripId, from.id, to.id, b.name, b.phone, req.user.id, fare, b.free ? 'Road passenger, travelled free' : 'Road passenger'],
+                               subtotal, discount_amount, currency, notes, holder_cnic)
+         VALUES ($1, $2, $3, $4, $5, 'on_road', $6, $7, 0, 'PKR', $8, $9) RETURNING id, pnr`,
+        [tripId, from.id, to.id, b.name, b.phone, req.user.id, fare, b.free ? 'Road passenger, travelled free' : 'Road passenger', cnicDigits(b.cnic)],
         client,
       );
       // Seat rules (bus, bookable, side-by-side gender rule) are checked by the ticket triggers.

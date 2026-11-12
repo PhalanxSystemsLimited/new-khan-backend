@@ -268,7 +268,7 @@ const counterCancelSchema = z
   .strict();
 
 router.get('/:id/counter-quote', requireAuth, requireRole(...STAFF_ROLES), validate({ params: uuidParam }), async (req, res) => {
-  res.json({ data: await getCounterQuote(req.valid.params.id) });
+  res.json({ data: await getCounterQuote(req.valid.params.id, req.user) });
 });
 
 router.post(
@@ -304,7 +304,9 @@ router.post(
     } catch (err) {
       // A wrong CNIC or code is kept in the activity log: repeated failures are worth a look.
       if (err.code === 'IDENTITY_MISMATCH') {
-        await audit({ req, action: 'booking.counter_identity_failed', entityType: 'booking', entityId: id }).catch(() => {});
+        // Which check failed, never the CNIC or code that was typed.
+        const check = req.valid.body.cnic ? 'cnic' : req.valid.body.code ? 'sms_code' : 'none';
+        await audit({ req, action: 'booking.counter_identity_failed', entityType: 'booking', entityId: id, newData: { check, message: err.message } }).catch(() => {});
       }
       throw err;
     }
@@ -350,7 +352,7 @@ ticketsRouter.post(
       [req.valid.params.id],
     );
     if (!t) throw AppError.unprocessable('Ticket not found, not confirmed, or trip is not boarding');
-    await audit({ req, action: 'ticket.board', entityType: 'ticket', entityId: t.id });
+    await audit({ req, action: 'ticket.board', entityType: 'ticket', entityId: t.id, newData: { ticketNo: t.ticketNo, status: t.status, boardedAt: t.boardedAt } });
     res.json({ data: t });
   },
 );

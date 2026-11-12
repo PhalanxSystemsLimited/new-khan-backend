@@ -28,6 +28,7 @@ import {
 } from './modules/roundtrips/roundtrips.routes.js';
 import tripVoucherRoutes from './modules/tripvouchers/tripVouchers.routes.js';
 import conductorRoutes from './modules/conductor/conductor.routes.js';
+import phoneRoutes from './modules/sms/sms.routes.js';
 import { adminEmployeesRouter, crewRouter } from './modules/employees/employees.routes.js';
 import { dayPlanRouter } from './modules/dayplan/dayPlan.routes.js';
 import { homeRouter } from './modules/home/home.routes.js';
@@ -150,6 +151,7 @@ export function createApp() {
   api.use('/reports', publicReportRouter);
   api.use('/trip-vouchers', tripVoucherRoutes);
   api.use('/conductor', conductorRoutes);
+  api.use('/phone', phoneRoutes);
   api.use('/admin/employees', adminEmployeesRouter);
   api.use('/admin/day-plan', dayPlanRouter);
   api.use('/', homeRouter); // /counter/departures, /me/trips, /board

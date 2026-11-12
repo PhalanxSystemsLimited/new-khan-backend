@@ -7,7 +7,7 @@ import { AppError } from '../../utils/AppError.js';
 import { audit } from '../../utils/audit.js';
 import { buildUpdate, offsetOf, paged } from '../../utils/sql.js';
 import {
-  idParam, intId, isoDate, isoDateTime, longText, money, pagination, text, uuidParam,
+  bigIdParam, idParam, intId, isoDate, isoDateTime, longText, money, pagination, text, uuidParam,
 } from '../../utils/schemas.js';
 import { getRouteWithStops } from '../routes/routes.routes.js';
 import { markPaymentRefunded } from '../bookings/bookings.service.js';
@@ -295,23 +295,86 @@ router.get('/reports/cash', validate({ query: rangeSchema }), async (req, res) =
   res.json({ data: rows });
 });
 
+// ======================= Activity log =======================
+/** A readable name for the changed item (booking PNR, employee code, voucher number...); NULL when there is none. */
+const AUDIT_ITEM_LABEL = `CASE a.entity_type
+    WHEN 'booking' THEN (SELECT 'Booking ' || b.pnr FROM bookings b WHERE b.id::text = a.entity_id)
+    WHEN 'ticket' THEN (SELECT 'Ticket ' || COALESCE(tk.ticket_no::text, '') || ' · booking ' || b.pnr FROM tickets tk JOIN bookings b ON b.id = tk.booking_id WHERE tk.id::text = a.entity_id)
+    WHEN 'payment' THEN (SELECT 'Payment · booking ' || b.pnr FROM payments p JOIN bookings b ON b.id = p.booking_id WHERE p.id::text = a.entity_id)
+    WHEN 'refund' THEN (SELECT 'Refund · booking ' || b.pnr FROM refunds rf JOIN bookings b ON b.id = rf.booking_id WHERE rf.id::text = a.entity_id)
+    WHEN 'trip' THEN (SELECT r.name || ' · ' || to_char(t.departure_at AT TIME ZONE 'Asia/Karachi', 'DD Mon YYYY, HH12:MI AM') FROM trips t JOIN routes r ON r.id = t.route_id WHERE t.id::text = a.entity_id)
+    WHEN 'schedule' THEN (SELECT r.name || ' · ' || to_char(sc.departure_time, 'HH12:MI AM') FROM schedules sc JOIN routes r ON r.id = sc.route_id WHERE sc.id::text = a.entity_id)
+    WHEN 'route' THEN (SELECT r.name FROM routes r WHERE r.id::text = a.entity_id)
+    WHEN 'employee' THEN (SELECT e.employee_code || ' · ' || e.full_name FROM employees e WHERE e.id::text = a.entity_id)
+    WHEN 'user' THEN (SELECT COALESCE(x.full_name, x.email) FROM users x WHERE x.id::text = a.entity_id)
+    WHEN 'conductor' THEN (SELECT c.full_name FROM conductors c WHERE c.id::text = a.entity_id)
+    WHEN 'staff_member' THEN (SELECT sd.full_name FROM staff_directory sd WHERE sd.id::text = a.entity_id)
+    WHEN 'promo_code' THEN (SELECT 'Promo ' || pc.code FROM promo_codes pc WHERE pc.id::text = a.entity_id)
+    WHEN 'trip_voucher' THEN (SELECT 'Voucher ' || v.voucher_no FROM trip_vouchers v WHERE v.id::text = a.entity_id)
+    WHEN 'terminal_voucher' THEN (SELECT 'Voucher ' || v.voucher_no FROM terminal_vouchers v WHERE v.id::text = a.entity_id)
+    WHEN 'round_trip' THEN (SELECT rt.route_label || ' · ' || to_char(rt.report_date, 'DD Mon YYYY') FROM round_trips rt WHERE rt.id::text = a.entity_id)
+    ELSE NULL
+  END`;
+
+const AUDIT_SELECT = `SELECT a.id, a.actor_id, a.action, a.entity_type, a.entity_id, a.old_data, a.new_data, host(a.ip_address) AS ip_address,
+         a.created_at, u.full_name AS actor_name, u.email AS actor_email, u.role::text AS actor_role, ${AUDIT_ITEM_LABEL} AS entity_label
+  FROM audit_logs a LEFT JOIN users u ON u.id = a.actor_id`;
+
+/** "%text%" for ILIKE, with the user's own % and _ taken literally. */
+const likeOf = (v) => `%${v.replace(/[\\%_]/g, (c) => "\\" + c)}%`;
+
 router.get(
   '/audit-logs',
   validate({
     query: pagination
-      .extend({ entityType: z.string().regex(/^[a-z_]{2,40}$/).optional(), entityId: z.string().max(64).optional() })
+      .extend({
+        entityType: z.string().regex(/^[a-z_]{2,40}$/).optional(),
+        entityId: z.string().max(64).optional(),
+        actorId: z.string().uuid().optional(),
+        from: isoDate.optional(), // Pakistan dates, inclusive
+        to: isoDate.optional(),
+        q: z.string().trim().min(1).max(80).optional(), // PNR, item id, action, person, or any text in the details
+      })
       .strict(),
   }),
   async (req, res) => {
     const q = req.valid.query;
     const { rows } = await query(
-      `SELECT a.*, u.full_name AS actor_name FROM audit_logs a LEFT JOIN users u ON u.id = a.actor_id
-       WHERE ($1::text IS NULL OR a.entity_type = $1) AND ($2::text IS NULL OR a.entity_id = $2)
-       ORDER BY a.created_at DESC LIMIT $3 OFFSET $4`,
-      [q.entityType ?? null, q.entityId ?? null, q.limit, offsetOf(q)],
+      `${AUDIT_SELECT}
+       WHERE ($1::text IS NULL OR a.entity_type = $1::text)
+         AND ($2::text IS NULL OR a.entity_id = $2::text)
+         AND ($3::uuid IS NULL OR a.actor_id = $3::uuid)
+         AND ($4::date IS NULL OR a.created_at >= ($4::date)::timestamp AT TIME ZONE 'Asia/Karachi')
+         AND ($5::date IS NULL OR a.created_at < ($5::date + 1)::timestamp AT TIME ZONE 'Asia/Karachi')
+         AND ($6::text IS NULL
+              OR a.entity_id ILIKE $6::text OR a.action ILIKE $6::text OR u.full_name ILIKE $6::text
+              OR a.new_data::text ILIKE $6::text OR a.old_data::text ILIKE $6::text
+              OR (a.entity_type = 'booking' AND EXISTS (SELECT 1 FROM bookings b WHERE b.id::text = a.entity_id AND b.pnr ILIKE $6::text)))
+       ORDER BY a.created_at DESC, a.id DESC LIMIT $7 OFFSET $8`,
+      [q.entityType ?? null, q.entityId ?? null, q.actorId ?? null, q.from ?? null, q.to ?? null, q.q ? likeOf(q.q) : null, q.limit, offsetOf(q)],
     );
     res.json({ data: rows, pagination: { page: q.page, limit: q.limit } });
   },
 );
+
+/** For the filters: every item type and every person that appears in the log. */
+router.get('/audit-logs/meta', async (_req, res) => {
+  const [types, actors] = await Promise.all([
+    query(`SELECT DISTINCT entity_type FROM audit_logs ORDER BY entity_type`),
+    query(
+      `SELECT u.id, COALESCE(u.full_name, u.email) AS name, u.role::text AS role
+       FROM users u WHERE u.id IN (SELECT DISTINCT actor_id FROM audit_logs WHERE actor_id IS NOT NULL)
+       ORDER BY 2`,
+    ),
+  ]);
+  res.json({ data: { types: types.rows.map((r) => r.entityType), actors: actors.rows } });
+});
+
+/** One entry (a link to it opens its details). */
+router.get('/audit-logs/:id', validate({ params: bigIdParam }), async (req, res) => {
+  const row = await one(`${AUDIT_SELECT} WHERE a.id = $1`, [req.valid.params.id]);
+  if (!row) throw AppError.notFound('Log entry not found');
+  res.json({ data: row });
+});
 
 export default router;

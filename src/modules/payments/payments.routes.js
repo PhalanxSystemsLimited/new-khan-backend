@@ -11,6 +11,7 @@ import { logger } from '../../utils/logger.js';
 import { money, uuid } from '../../utils/schemas.js';
 import { assertCanAccess, confirmBookingInTx, getBookingDetail } from '../bookings/bookings.service.js';
 import { gatewayFor, gateways, ONLINE_METHODS } from './gateways.js';
+import { sendBookingConfirmationSms } from '../sms/sms.service.js';
 import { PAID_STATE, fetchTracker, frontendUrl, isValidTracker, safepayEnabled } from './safepay.js';
 
 const router = Router();
@@ -170,13 +171,17 @@ export async function paymentWebhook(req, res) {
   }
 
   const ev = result.event;
+  let bookingId = null;
   const outcome = await withTransaction(async (client) => {
     const p = ev.paymentId
       ? await one(`SELECT * FROM payments WHERE id = $1 AND gateway = $2 FOR UPDATE`, [ev.paymentId, gateway], client)
       : await one(`SELECT * FROM payments WHERE gateway = $1 AND gateway_txn_id = $2 FOR UPDATE`, [gateway, ev.txnId], client);
     if (!p) throw AppError.notFound('Payment not found');
+    bookingId = p.bookingId;
     return settlePayment(client, p, ev);
   });
+  // After the commit: the confirmation SMS (online bookings, only when SMS is set up; never throws).
+  if (outcome === 'confirmed') await sendBookingConfirmationSms(bookingId);
 
   logger.info({ gateway, outcome }, 'Webhook processed');
   res.json({ received: true, outcome });
@@ -190,7 +195,7 @@ export async function paymentWebhook(req, res) {
 async function settleSafepayTracker(tracker, source) {
   const status = await fetchTracker(tracker);
   if (status.state !== PAID_STATE) return { outcome: 'unpaid', state: status.state };
-  return withTransaction(async (client) => {
+  const result = await withTransaction(async (client) => {
     const p = await one(`SELECT * FROM payments WHERE gateway = 'safepay' AND gateway_txn_id = $1 FOR UPDATE`, [tracker], client);
     if (!p) return { outcome: 'not_found' };
     const outcome = await settlePayment(client, p, {
@@ -202,6 +207,9 @@ async function settleSafepayTracker(tracker, source) {
     });
     return { outcome, bookingId: p.bookingId };
   });
+  // After the commit: the confirmation SMS (online bookings, only when SMS is set up; never throws).
+  if (result.outcome === 'confirmed') await sendBookingConfirmationSms(result.bookingId);
+  return result;
 }
 
 /**

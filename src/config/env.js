@@ -51,6 +51,21 @@ const schema = z.object({
   // Round Trip Report page opened by a voucher QR: false = staff must sign in (default), true = anyone with the link.
   PUBLIC_TRIP_REPORT: bool.default('false'),
 
+  // ---- SMS (off until SMS_API_URL is set) ----
+  // Any Pakistani bulk-SMS provider (Jazz, Zong, Telenor or an aggregator) that sends by calling a web address.
+  // SMS_API_URL is the provider's sending address with placeholders the server fills in:
+  //   {to} {text} {sender} {username} {password}
+  // e.g. https://sms.example.pk/api/send?user={username}&pass={password}&from={sender}&to={to}&msg={text}
+  SMS_API_URL: z.union([z.literal(''), z.string().url()]).optional().default(''),
+  SMS_METHOD: z.enum(['GET', 'POST']).default('GET'), // POST sends the address's "?..." part as a form body
+  SMS_USERNAME: z.string().optional().default(''),
+  SMS_PASSWORD: z.string().optional().default(''),
+  SMS_SENDER: z.string().trim().max(20).optional().default(''), // the sender name, e.g. NEWKHAN
+  // How the provider wants numbers: intl = 923001234567, local = 03001234567, plus = +923001234567.
+  SMS_PHONE_FORMAT: z.enum(['intl', 'local', 'plus']).default('intl'),
+  // Some providers answer "OK" even on failure: if set, the reply must contain this text to count as sent.
+  SMS_SUCCESS_TEXT: z.string().optional().default(''),
+
   // ---- Safepay (enabled when SAFEPAY_API_KEY is set) ----
   SAFEPAY_ENV: z.enum(['sandbox', 'production']).default('sandbox'),
   SAFEPAY_API_KEY: z.string().trim().optional().default(''),

@@ -419,7 +419,7 @@ CREATE TABLE refunds (
     created_at          TIMESTAMPTZ NOT NULL DEFAULT now(),
     updated_at          TIMESTAMPTZ NOT NULL DEFAULT now(),
     CONSTRAINT refunds_channel_valid CHECK (channel IN ('online', 'counter')),
-    CONSTRAINT refunds_identity_check_valid CHECK (identity_check IS NULL OR identity_check IN ('cnic', 'sms_code'))
+    CONSTRAINT refunds_identity_check_valid CHECK (identity_check IS NULL OR identity_check IN ('cnic', 'sms_code', 'manager'))
 );
 CREATE INDEX refunds_booking_idx ON refunds (booking_id);
 
@@ -436,6 +436,38 @@ CREATE TABLE refund_codes (
     created_at      TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 CREATE INDEX refund_codes_booking_idx ON refund_codes (booking_id, created_at DESC);
+
+-- SMS (off until SMS_API_URL is set): every message tried, phone-verification codes, verified numbers
+CREATE TABLE sms_messages (
+    id          BIGSERIAL PRIMARY KEY,
+    to_masked   VARCHAR(20),
+    kind        VARCHAR(30) NOT NULL,          -- booking_confirmed | phone_code | refund_code
+    booking_id  UUID REFERENCES bookings(id) ON DELETE SET NULL,
+    status      VARCHAR(10) NOT NULL CHECK (status IN ('sent', 'failed')),
+    error       TEXT,
+    created_at  TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX sms_messages_created_idx ON sms_messages (created_at DESC);
+CREATE UNIQUE INDEX sms_messages_one_confirmation ON sms_messages (booking_id) WHERE kind = 'booking_confirmed' AND status = 'sent';
+
+CREATE TABLE phone_codes (
+    id          BIGSERIAL PRIMARY KEY,
+    user_id     UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    phone       VARCHAR(20) NOT NULL,
+    code_hash   CHAR(64) NOT NULL,
+    attempts    INT NOT NULL DEFAULT 0,
+    expires_at  TIMESTAMPTZ NOT NULL,
+    used_at     TIMESTAMPTZ,
+    created_at  TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX phone_codes_user_idx ON phone_codes (user_id, created_at DESC);
+
+CREATE TABLE verified_phones (
+    user_id      UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    phone        VARCHAR(20) NOT NULL,
+    verified_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
+    PRIMARY KEY (user_id, phone)
+);
 
 -- Hours-before-departure -> refund % rules
 CREATE TABLE cancellation_policies (
@@ -495,6 +527,8 @@ CREATE TABLE audit_logs (
     created_at          TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 CREATE INDEX audit_logs_entity_idx ON audit_logs (entity_type, entity_id, created_at DESC);
+CREATE INDEX audit_logs_created_idx ON audit_logs (created_at DESC, id DESC);
+CREATE INDEX audit_logs_actor_idx ON audit_logs (actor_id, created_at DESC);
 
 -- ---------------------------------------------------------------------
 -- 13. updated_at TRIGGERS

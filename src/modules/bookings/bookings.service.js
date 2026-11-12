@@ -2,9 +2,9 @@ import { createHash, randomInt } from 'node:crypto';
 import { query, one, withTransaction } from '../../config/db.js';
 import { env } from '../../config/env.js';
 import { AppError } from '../../utils/AppError.js';
-import { isStaff } from '../../middleware/auth.js';
+import { isStaff, MANAGER_ROLES } from '../../middleware/auth.js';
 import { cnicDigits, cnicDisplay, cnicMasked } from '../../utils/cnic.js';
-import { sendSms } from '../../utils/sms.js';
+import { sendSms, smsEnabled } from '../../utils/sms.js';
 import { findFare } from '../fares/fares.service.js';
 
 const MAX_PENDING_PER_USER = 3;
@@ -136,8 +136,8 @@ export async function createBooking(user, input) {
     // Booking holder's CNIC. Customer: their account's CNIC, always; an account without one (made before CNICs
     // were asked for, or by phone code) gets the one typed now, saved for every later booking. Staff: the
     // walk-in customer's CNIC they typed.
-    // The CNIC is optional (many passengers are picked up locally or on the road). Without one, a counter refund
-    // is confirmed with a code sent by SMS to the booking's phone instead.
+    // Required on every new booking (one per booking: a family travels on one CNIC). It is what the counter
+    // checks before a refund. Bookings made before it was required have none (see counterCancel).
     let holderCnic = null;
     if (staff) {
       if (input.holderCnic) holderCnic = cnicDigits(input.holderCnic);
@@ -147,6 +147,18 @@ export async function createBooking(user, input) {
       else if (input.holderCnic) {
         holderCnic = cnicDigits(input.holderCnic);
         await client.query(`UPDATE users SET cnic = $2 WHERE id = $1`, [user.id, cnicDisplay(holderCnic)]);
+      }
+    }
+    if (!holderCnic) {
+      throw new AppError(400, "Enter the booking holder's CNIC (13 digits, like 35202-1234567-1).", 'CNIC_REQUIRED');
+    }
+
+    // Online bookings, once SMS is set up: the contact mobile must have been verified with a code (asked once
+    // per number). While SMS is off this step is skipped.
+    if (!staff && smsEnabled()) {
+      const ok = await one(`SELECT 1 FROM verified_phones WHERE user_id = $1 AND phone = $2`, [user.id, input.contact.phone], client);
+      if (!ok) {
+        throw new AppError(428, 'Please verify your mobile number with the code we send by SMS.', 'PHONE_NOT_VERIFIED');
       }
     }
 
@@ -404,8 +416,9 @@ export async function markPaymentRefunded(client, paymentId) {
 //  - The refund is worked out by the cancellation rules, never typed in.
 //  - Paid in cash: the refund is paid out in cash there and then (recorded as processed by that staff member).
 //  - Paid online: the booking is cancelled, and the refund waits for a super admin to approve it online.
-//  - Before anything happens the holder is confirmed: the CNIC typed in must match the booking's, or (older
-//    bookings without a CNIC) the code sent by SMS to the booking's phone number must be entered.
+//  - Before anything happens the holder is confirmed: the CNIC typed in must match the booking's. Older bookings
+//    made before CNICs were required have none: a manager or admin approves the refund themselves, or (once SMS
+//    is set up) the code sent by SMS to the booking's phone number is entered.
 // ---------------------------------------------------------------------------
 const CODE_TTL_MINUTES = 10;
 const CODE_MAX_ATTEMPTS = 5;
@@ -422,8 +435,18 @@ function assertCounterCancellable(bk) {
   }
 }
 
+/**
+ * How the holder is confirmed: the CNIC on the booking; for older bookings with none, a code sent by SMS when SMS
+ * is set up, otherwise a manager or admin approves it themselves ('manager').
+ */
+function identityCheckFor(bk, staff) {
+  if (bk.holderCnic) return 'cnic';
+  return smsEnabled() ? 'sms_code' : 'manager';
+}
+const isManager = (u) => MANAGER_ROLES.includes(u?.role);
+
 /** What the counter screen shows before cancelling: the refund, how it is paid, and how to confirm the holder. */
-export async function getCounterQuote(id) {
+export async function getCounterQuote(id, staff) {
   return withTransaction(async (client) => {
     const bk = await lockBookingWithTrip(client, id);
     assertCounterCancellable(bk);
@@ -437,7 +460,9 @@ export async function getCounterQuote(id) {
       cancellationFee: q.fee,
       hoursBeforeDeparture: q.hoursBefore,
       refundHow: refundHow(q),
-      identityCheck: bk.holderCnic ? 'cnic' : 'sms_code',
+      identityCheck: identityCheckFor(bk, staff),
+      // Managers and admins may approve a refund of a booking that has no CNIC, writing how they checked.
+      canApproveWithoutCnic: !bk.holderCnic && isManager(staff),
       holderCnicMasked: cnicMasked(bk.holderCnic),
       phoneMasked: maskPhone(bk.contactPhone),
     };
@@ -450,6 +475,9 @@ export async function sendCounterCode(id, staff) {
   if (!bk) throw AppError.notFound('Booking not found');
   if (bk.status !== 'confirmed') throw AppError.unprocessable(`This booking is ${bk.status}.`);
   if (bk.holderCnic) throw AppError.unprocessable('This booking has a CNIC on file. Check the CNIC instead.');
+  if (!smsEnabled() && env.isProd) {
+    throw AppError.unprocessable('SMS is not set up yet. A manager or admin can approve this refund instead.');
+  }
   const recent = await one(
     `SELECT count(*)::int AS n FROM refund_codes WHERE booking_id = $1 AND created_at > now() - interval '1 hour'`,
     [bk.id],
@@ -460,6 +488,7 @@ export async function sendCounterCode(id, staff) {
   const sms = await sendSms(
     bk.contactPhone,
     `New Khan: code ${code} lets the counter cancel booking ${bk.pnr} and refund it. Valid ${CODE_TTL_MINUTES} minutes. Only share it at a New Khan counter.`,
+    { kind: 'refund_code', bookingId: bk.id },
   );
   await withTransaction(async (client) => {
     await client.query(`UPDATE refund_codes SET used_at = now() WHERE booking_id = $1 AND used_at IS NULL`, [bk.id]);
@@ -502,10 +531,24 @@ export async function counterCancel(id, staff, { cnic, code, reason }) {
       throw new AppError(422, 'This CNIC does not match the booking holder. Do not cancel or refund.', 'IDENTITY_MISMATCH');
     }
     identityCheck = 'cnic';
-  } else {
-    if (!code) throw AppError.badRequest("Enter the code sent to the booking's phone number.");
+  } else if (code) {
+    // Older booking without a CNIC: the code sent to the booking's phone...
     codeId = await verifyCounterCode(pre.id, code);
     identityCheck = 'sms_code';
+  } else if (isManager(staff)) {
+    // ...or a manager / admin confirms the holder themselves (always allowed; the only way while SMS is off).
+    if (!reason || reason.trim().length < 5) {
+      throw AppError.badRequest('This booking has no CNIC. Write how you confirmed the customer (at least 5 characters) to approve the refund.');
+    }
+    identityCheck = 'manager';
+  } else {
+    throw new AppError(
+      403,
+      smsEnabled()
+        ? "This booking has no CNIC. Send a code to the booking's phone, or ask a manager to approve the refund."
+        : 'This booking was made before CNICs were required. A manager or admin must approve this refund.',
+      'MANAGER_APPROVAL_REQUIRED',
+    );
   }
 
   const note = reason ?? 'Cancelled at the counter';

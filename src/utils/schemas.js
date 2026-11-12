@@ -50,10 +50,23 @@ export const password = z
     'Password must contain an upper-case letter, a lower-case letter, a number and a special character (e.g. ! @ # $ %)',
   );
 
+/**
+ * Obviously made-up CNICs: one digit repeated (11111-1111111-1), a leading 0 (no province code starts with 0),
+ * or a straight run like 12345-6789012-3.
+ */
+export function cnicLooksFake(v) {
+  const d = String(v ?? '').replace(/\D/g, '');
+  if (d.length !== 13) return false;
+  if (/^(\d)\1{12}$/.test(d)) return true;
+  if (d[0] === '0') return true;
+  return '1234567890123456789'.includes(d) || '9876543210987654321'.includes(d);
+}
+
 export const cnic = z
   .string()
   .trim()
   .regex(/^\d{5}-?\d{7}-?\d$/, 'CNIC must be like 35202-1234567-1')
+  .refine((v) => !cnicLooksFake(v), 'This CNIC number is not valid. Please check it.')
   .transform((v) => v.replace(/-/g, '').replace(/^(\d{5})(\d{7})(\d)$/, '$1-$2-$3'));
 
 export const isoDate = z
