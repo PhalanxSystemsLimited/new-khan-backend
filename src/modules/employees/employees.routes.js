@@ -4,6 +4,7 @@
  *   GET   /admin/employees/next-code       the ID the next employee will get (only taken when saved)
  *   GET   /admin/employees/lists           departments, designations, licence types, issuing authorities
  *   POST  /admin/employees/lists/:list     add to a list;  PATCH /admin/employees/lists/:list/:id  rename, (de)activate
+ *   GET   /admin/employees/team?kind=hostess|cashier   the Hostesses / Cashiers pages (same people, with their trips / reports)
  *   GET   /admin/employees/:id             one employee
  *   POST  /admin/employees                 register (the database assigns the ID)
  *   PATCH /admin/employees/:id             update
@@ -232,6 +233,49 @@ adminEmployeesRouter.patch(
 
 // ---- Employees ----
 const idParam = z.object({ id: intId }).strict();
+
+// ---- Hostesses / Cashiers (Fleet & people shortcuts) ----
+// The employees whose designation feeds the hostess or cashier dropdown: the same people, not a separate list.
+// Trips and round trip reports keep the person's NAME (as chosen in the dropdown), so they are matched by name,
+// ignoring case and spaces around it.
+const sameName = (col) => `lower(btrim(${col})) = lower(btrim(e.full_name))`;
+const TEAM_EXTRA = {
+  hostess: `
+    (SELECT count(*)::int FROM trips t
+      WHERE ${sameName('t.hostess_name')} AND t.status::text <> 'cancelled'
+        AND t.departure_at >= now() AND t.departure_at < now() + interval '7 days') AS trips_next_7_days,
+    (SELECT json_build_object('departureAt', t.departure_at, 'routeName', r.name, 'busNo', b.registration_no)
+       FROM trips t JOIN routes r ON r.id = t.route_id JOIN buses b ON b.id = t.bus_id
+      WHERE ${sameName('t.hostess_name')} AND t.status::text IN ('scheduled', 'delayed', 'boarding')
+        AND t.departure_at >= now() - interval '2 hours'
+      ORDER BY t.departure_at LIMIT 1) AS next_trip`,
+  cashier: `
+    (SELECT count(*)::int FROM round_trips rt
+      WHERE ${sameName('rt.cashier_name')} AND rt.report_date >= CURRENT_DATE - 30) AS reports_last_30_days,
+    (SELECT max(rt.report_date)::text FROM round_trips rt WHERE ${sameName('rt.cashier_name')}) AS last_report_date,
+    (SELECT c.name || ' · ' || tm.name FROM terminals tm JOIN cities c ON c.id = tm.city_id WHERE tm.id = u.terminal_id) AS login_terminal`,
+};
+
+adminEmployeesRouter.get(
+  '/team',
+  validate({ query: z.object({ kind: z.enum(['hostess', 'cashier']), status: z.enum(['active', 'left', 'all']).default('active') }).strict() }),
+  async (req, res) => {
+    const { kind, status } = req.valid.query;
+    const { rows } = await query(
+      `SELECT e.id, e.employee_code, e.full_name, e.phone, e.is_active, e.left_on::text AS left_on, e.user_id,
+              g.name AS designation, g.suggested_role,
+              u.email AS login_email, u.role::text AS login_role, u.terminal_id AS login_terminal_id,
+              ${TEAM_EXTRA[kind]}
+       FROM employees e
+       JOIN designations g ON g.id = e.designation_id
+       LEFT JOIN users u ON u.id = e.user_id
+       WHERE g.crew = $1 AND ($2::text = 'all' OR ($2::text = 'active') = e.is_active)
+       ORDER BY e.is_active DESC, e.full_name`,
+      [kind, status],
+    );
+    res.json({ data: rows });
+  },
+);
 
 adminEmployeesRouter.get('/:id', validate({ params: idParam }), async (req, res) => {
   const e = await loadEmployee(req.valid.params.id);

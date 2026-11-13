@@ -46,7 +46,7 @@ async function loadTrips(from, to, client) {
     `SELECT t.id, t.departure_at, t.delay_minutes, t.status::text AS status, t.hostess_name, t.route_id,
             r.name AS route_name, r.code AS route_code,
             ot.id AS terminal_id, oc.name AS terminal_city, ot.name AS terminal_name,
-            b.registration_no AS bus_no, b.fleet_no, l.total_seats,
+            b.registration_no AS bus_no, b.fleet_no, b.has_hostess, l.total_seats,
             d.full_name AS driver_name, d.phone AS driver_phone,
             cn.full_name AS conductor_name, cn.phone AS conductor_phone, si.full_name AS stand_in_name,
             (SELECT count(*) FROM tickets tk WHERE tk.trip_id = t.id AND tk.status IN ('held','reserved','confirmed','boarded'))::int AS seats_sold
@@ -92,6 +92,7 @@ async function loadTrips(from, to, client) {
       conductorName: t.conductorName ?? t.standInName ?? null,
       conductorPhone: t.conductorName ? t.conductorPhone : null,
       hostessName: t.hostessName,
+      busHasHostess: Boolean(t.hasHostess), // the bus carries a hostess (Fleet & people > Buses)
       // Every stop with its expected time (delay included).
       stops: stops
         .filter((s) => s.routeId === t.routeId)
@@ -133,6 +134,8 @@ dayPlanRouter.get('/', validate({ query: range }), async (req, res) => {
       trips: dayTrips,
       removed: gone.map((s) => ({ id: s.id, routeName: s.routeName, departureAt: s.departureAt, busNo: s.busNo })),
       missingCrew: dayTrips.filter((t) => t.status !== 'cancelled' && (!t.driverName || !t.conductorName)).length,
+      // Buses that carry a hostess but have none assigned yet (counted separately from driver / conductor).
+      missingHostess: dayTrips.filter((t) => t.status !== 'cancelled' && t.busHasHostess && !t.hostessName).length,
     });
   }
   res.set('Cache-Control', 'no-store');
