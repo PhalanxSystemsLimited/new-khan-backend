@@ -47,17 +47,77 @@ export async function tripOptions({ from, to, busId }) {
 
 /** Terminals of the report's trips that have not generated their voucher yet. */
 export async function missingVouchers(client, roundTripId) {
-  const { rows: legs } = await query(`SELECT id, trip_id FROM round_trip_legs WHERE round_trip_id = $1 AND trip_id IS NOT NULL`, [roundTripId], client);
+  const { rows: legs } = await query(
+    `SELECT id, leg_no, trip_id FROM round_trip_legs WHERE round_trip_id = $1 AND trip_id IS NOT NULL ORDER BY leg_no`,
+    [roundTripId],
+    client,
+  );
   const missing = [];
   for (const leg of legs) {
     const loaded = await loadTrip(leg.tripId, client);
     if (!loaded || loaded.trip.status === 'cancelled') continue;
     const { rows: done } = await query(`SELECT boarding_stop_id FROM trip_vouchers WHERE trip_id = $1 AND status = 'generated'`, [leg.tripId], client);
     for (const s of voucherStops(loaded.stops)) {
-      if (!done.some((d) => d.boardingStopId === s.id)) missing.push({ tripId: leg.tripId, routeName: loaded.trip.routeName, city: s.city });
+      if (!done.some((d) => d.boardingStopId === s.id)) {
+        missing.push({ tripId: leg.tripId, legNo: leg.legNo, departureAt: loaded.trip.departureAt, routeName: loaded.trip.routeName, city: s.city });
+      }
     }
   }
   return missing;
+}
+
+const shortDate = (d) => new Date(d).toLocaleDateString('en-GB', { timeZone: TZ, day: 'numeric', month: 'short' });
+
+/** "Leg 1 (6 Nov): Islamabad · Leg 2 (7 Nov): Islamabad" for messages about missing vouchers. */
+export function missingByLeg(missing) {
+  const legs = new Map();
+  for (const m of missing) {
+    const key = m.legNo ?? 0;
+    if (!legs.has(key)) legs.set(key, { legNo: m.legNo, date: m.departureAt ? shortDate(m.departureAt) : '', cities: [] });
+    legs.get(key).cities.push(m.city);
+  }
+  return [...legs.values()].map((l) => `${l.legNo ? `Leg ${l.legNo}${l.date ? ` (${l.date})` : ''}: ` : ''}${l.cities.join(', ')}`).join(' · ');
+}
+
+/**
+ * Warnings for a report whose legs do not look like one journey (automatic or built by hand). Advisory only:
+ *   a leg that never ran or was cancelled, a leg that does not start where the previous one ended (a trip is
+ *   missing), a long gap between legs, and legs spread over more than 3 days.
+ */
+export async function reportChecks(client, roundTripId) {
+  const { rows } = await query(
+    `SELECT l.leg_no, t.id AS trip_id, t.status::text AS status, t.departure_at, COALESCE(t.arrival_at, t.departure_at) AS arrival_at,
+            oc.id AS from_city_id, oc.name AS from_city, dc.id AS to_city_id, dc.name AS to_city
+     FROM round_trip_legs l
+     JOIN trips t ON t.id = l.trip_id
+     JOIN routes r ON r.id = t.route_id
+     JOIN terminals ot ON ot.id = r.origin_terminal_id JOIN cities oc ON oc.id = ot.city_id
+     JOIN terminals dt ON dt.id = r.destination_terminal_id JOIN cities dc ON dc.id = dt.city_id
+     WHERE l.round_trip_id = $1
+     ORDER BY l.leg_no`,
+    [roundTripId],
+    client,
+  );
+  const issues = [];
+  const hoursBetween = (a, b) => (new Date(b).getTime() - new Date(a).getTime()) / 3_600_000;
+  const spell = (h) => (h < 48 ? `${Math.round(h)} hours` : `${Math.round(h / 24)} days`);
+  rows.forEach((leg, i) => {
+    const name = `Leg ${leg.legNo} (${shortDate(leg.departureAt)})`;
+    if (leg.status === 'cancelled') issues.push(`${name} was cancelled.`);
+    else if (!RAN.includes(leg.status)) issues.push(`${name} was never marked departed or arrived.`);
+    const prev = rows[i - 1];
+    if (!prev) return;
+    if (prev.toCityId !== leg.fromCityId) {
+      issues.push(`Leg ${leg.legNo} starts in ${leg.fromCity}, but leg ${prev.legNo} ended in ${prev.toCity}. A trip may be missing.`);
+    }
+    const gap = hoursBetween(prev.arrivalAt, leg.departureAt);
+    if (gap > MAX_LEG_GAP_HOURS) issues.push(`Leg ${leg.legNo} left ${spell(gap)} after leg ${prev.legNo} arrived.`);
+  });
+  if (rows.length > 1) {
+    const span = hoursBetween(rows[0].departureAt, rows[rows.length - 1].arrivalAt);
+    if (span > 72) issues.push(`These legs span ${spell(span)} (a round trip normally takes 1 to 3 days).`);
+  }
+  return issues;
 }
 
 /** The figures of one report row, from a generated terminal voucher. */
@@ -277,28 +337,48 @@ export async function createFromTripIds(client, { userId, tripIds, autoCreated =
 export const createFromTrips = (client, { userId, outboundTripId, returnTripId = null }) =>
   createFromTripIds(client, { userId, tripIds: [outboundTripId, returnTripId].filter(Boolean) });
 
+/** A gap longer than this between two legs means a different journey (the round trip walk stops there). */
+export const MAX_LEG_GAP_HOURS = 36;
+const RAN = ['departed', 'arrived'];
+
 /**
  * The bus's round trip that ends with `lastTripId`: walking back through the bus's earlier trips until the one that
- * left an origin terminal (Lahore, Multan). Trips already in a report, cancelled or more than MAX_LEGS back stop
- * the walk. Returns the trip ids in the order travelled.
+ * left an origin terminal (Lahore, Multan). The walk also stops (so a report never sweeps up days of unrelated trips)
+ * at an earlier trip that:
+ *   - is already in a report, or more than MAX_LEGS back (as before; cancelled trips are skipped);
+ *   - did not run (not marked departed or arrived);
+ *   - does not connect: it ended in a different city from where the next leg starts (a trip is missing);
+ *   - arrived more than MAX_LEG_GAP_HOURS before the next leg left.
+ * Returns the trip ids in the order travelled.
  */
 export async function chainEndingWith(client, lastTripId) {
   // Compared inside the database: a JavaScript date would round the departure time to milliseconds.
+  // Rows come newest first; lag() is the next (later) leg of each row.
   const { rows } = await query(
-    `SELECT t.id, ot.is_origin AS starts_at_origin,
-            EXISTS (SELECT 1 FROM round_trip_legs l WHERE l.trip_id = t.id) AS in_report
+    `SELECT t.id, t.status::text AS status, ot.is_origin AS starts_at_origin, dt.city_id AS to_city_id,
+            EXISTS (SELECT 1 FROM round_trip_legs l WHERE l.trip_id = t.id) AS in_report,
+            lag(ot.city_id) OVER w AS next_from_city_id,
+            EXTRACT(EPOCH FROM (lag(t.departure_at) OVER w - COALESCE(t.arrival_at, t.departure_at))) / 3600 AS gap_hours
      FROM trips last
      JOIN trips t ON t.bus_id = last.bus_id AND t.departure_at <= last.departure_at AND t.status <> 'cancelled'
-     JOIN routes r ON r.id = t.route_id JOIN terminals ot ON ot.id = r.origin_terminal_id
+     JOIN routes r ON r.id = t.route_id
+     JOIN terminals ot ON ot.id = r.origin_terminal_id
+     JOIN terminals dt ON dt.id = r.destination_terminal_id
      WHERE last.id = $1
+     WINDOW w AS (ORDER BY t.departure_at DESC)
      ORDER BY t.departure_at DESC
      LIMIT ${MAX_LEGS}`,
     [lastTripId],
     client,
   );
   const chain = [];
-  for (const t of rows) {
+  for (const [i, t] of rows.entries()) {
     if (t.inReport) break;
+    if (i > 0) {
+      if (!RAN.includes(t.status)) break;
+      if (t.toCityId !== t.nextFromCityId) break;
+      if (Number(t.gapHours) > MAX_LEG_GAP_HOURS) break;
+    }
     chain.unshift(t.id);
     if (t.startsAtOrigin) break;
   }

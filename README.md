@@ -347,6 +347,14 @@ Code: `src/modules/roundtrips/` (`report.calc.js` holds every formula; `roundtri
   "off on this route", optional bus-class / hostess-bus limits). They are **copied** onto a report when it is created; later
   changes to the defaults never touch existing reports. Drafts can "Apply new defaults" (lines changed by hand are kept unless
   ticked). Per-report amount changes are admin-only and marked.
+- **Automatic reports** (`roundtrips.sync.js`): when a bus arrives back at a home base (terminals with `is_origin`: Lahore,
+  Multan), the report is built by walking back through the bus's earlier trips to the one that left a home base. The walk
+  stops at an earlier trip that is already in a report, more than 12 legs back, **did not run** (not departed/arrived),
+  **does not connect** (it ended in a different city from where the next leg starts) or arrived **more than 36 hours**
+  (`MAX_LEG_GAP_HOURS`) before the next leg left. Cancelled trips are skipped.
+- **Report checks** (`GET /admin/round-trips/:id/checks`): plain-words warnings shown on a draft whose legs do not look like
+  one journey (a leg that never ran or was cancelled, legs that do not connect, a gap over 36 hours, legs spread over more
+  than 3 days). Advice only; nothing is blocked. Missing terminal vouchers are listed per leg ("Leg 1 (6 Nov): Islamabad").
 - **Finalize:** a finalized report cannot be changed (the API answers 409 `FINALIZED`).
 - **QR codes:** every voucher (and the report header) has a 128-bit random token; the QR opens `APP_URL/r/<token>`, which loads
   `GET /reports/r/:token` fresh on every visit (`Cache-Control: no-store`) and highlights the scanned voucher. Staff must sign in

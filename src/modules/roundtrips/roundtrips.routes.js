@@ -21,7 +21,7 @@ import {
 } from './roundtrips.service.js';
 import { fuelAmount } from './report.calc.js';
 import {
-  createFromTrips, MAX_LEGS, missingVouchers, scanCompletedRoundTrips, syncFromVouchers, tripOptions,
+  createFromTrips, MAX_LEGS, missingByLeg, missingVouchers, reportChecks, scanCompletedRoundTrips, syncFromVouchers, tripOptions,
 } from './roundtrips.sync.js';
 
 // ---------------------------------------------------------------------------------------------------------------
@@ -191,6 +191,11 @@ adminRoundTripsRouter.get('/:id/missing-vouchers', validate({ params: tripParams
   res.json({ data: await missingVouchers(undefined, req.valid.params.id) });
 });
 
+/** Plain-words warnings when the report's legs do not look like one journey (never blocks anything). */
+adminRoundTripsRouter.get('/:id/checks', validate({ params: tripParams }), async (req, res) => {
+  res.json({ data: await reportChecks(undefined, req.valid.params.id) });
+});
+
 adminRoundTripsRouter.post('/', validate({ body: createTripSchema }), async (req, res) => {
   const out = await withTransaction(async (client) => {
     const created = await createRoundTrip(client, { userId: req.user.id, input: req.valid.body });
@@ -255,7 +260,7 @@ adminRoundTripsRouter.post('/:id/finalize', validate({ params: tripParams }), as
     const missing = await missingVouchers(client, id);
     if (missing.length) {
       throw AppError.unprocessable(
-        `These terminals have not generated their voucher yet: ${missing.map((m) => m.city).join(', ')}. Generate them first (Operations → Vouchers).`,
+        `These terminals have not generated their voucher yet: ${missingByLeg(missing)}. Generate them first (Operations → Vouchers).`,
         missing,
       );
     }
