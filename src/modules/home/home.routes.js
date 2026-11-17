@@ -12,6 +12,8 @@ import { validate } from '../../middleware/validate.js';
 import { requireAuth, requireRole, EMPLOYEE_ROLES, MANAGER_ROLES, STAFF_ROLES } from '../../middleware/auth.js';
 import { AppError } from '../../utils/AppError.js';
 import { intId, isoDate } from '../../utils/schemas.js';
+import { cargoForDepartures, cargoListsReady } from '../cargo/cargo.lists.js';
+import { arrivalCounts } from '../cargo/cargo.arrival.js';
 
 const TZ = 'Asia/Karachi';
 const today = () => new Date().toLocaleDateString('en-CA', { timeZone: TZ });
@@ -114,10 +116,20 @@ homeRouter.get(
         conductorName: r.conductorName,
         hasConductor: r.hasConductor,
         destinations,
+        // A bus can take cargo from here when the voucher can be made here (a boarding point, not the last stop).
+        takesCargo: r.isBoardingPoint && !r.endsHere && stops.rows.some((s) => s.routeId === r.routeId && s.stopOrder > r.stopOrder),
       };
     });
+    // Cargo lists per bus (when the cargo tables exist).
+    let cargo = null;
+    let cargoArrivals = null;
+    if (await cargoListsReady()) {
+      cargoArrivals = await arrivalCounts(undefined, terminalId); // parcels coming here / waiting for collection
+      cargo = await cargoForDepartures(undefined, { terminalId, trips: departures.filter((d) => d.takesCargo) });
+      for (const d of departures) d.cargo = d.takesCargo ? cargo.byTrip[d.tripId] ?? { listId: null, parcelCount: 0, status: null } : null;
+    }
     res.set('Cache-Control', 'no-store');
-    res.json({ data: { date, terminal: { id: terminal.id, name: terminal.name, city: terminal.city }, departures } });
+    res.json({ data: { date, terminal: { id: terminal.id, name: terminal.name, city: terminal.city }, departures, cargoWaiting: cargo ? cargo.waiting : null, cargoArrivals } });
   },
 );
 

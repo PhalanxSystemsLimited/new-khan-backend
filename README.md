@@ -490,6 +490,14 @@ Access: **public**, **C** = any signed-in user, **owner** = the booking's custom
 | GET | `/trips?date=` · `/trips/:id/manifest` | S | Operations |
 | POST · PATCH | `/trips` · `/trips/:id/assignment` | A | Ad-hoc trips (optional `returnTrip: { routeId, departureAt, driverId? }` adds the same bus's return trip: both or neither; it must start where the bus arrives and leave after it arrives), bus/crew assignment |
 | PATCH | `/trips/:id/status` | S (cancel = A) | boarding / departed / arrived / delayed / cancelled |
+| GET | `/cargo/setup` · `/cargo/quote` | S | Cargo: terminals, rates, settings; the rate-table charge |
+| PUT · POST · PATCH | `/cargo/settings` · `/cargo/rates[/:id]` | A | Cargo rules / not-allowed text printed on the slip, overdue days, staff may change charge; rates per city pair (per kg, per piece, minimum) |
+| GET · POST | `/cargo/parcels` | S | Search parcels (CG number or scanned QR link, phone, CNIC, name) · book a parcel (counter staff: own terminal only; lower charge needs a reason) |
+| GET · POST | `/cargo/parcels/:id[/slip]` · `/cargo/parcels/:id/cancel` | S | A parcel with its history, slip data with QR · cancel while not on a bus (reason; counter staff: own terminal) |
+| GET · POST · DELETE | `/cargo/loading/:tripId/:stopId[/parcels/:parcelId]` | S | Bus cargo list at a terminal: view, add a parcel (`{ parcel: "CG-…" }` or a scanned link), take one off. Only parcels booked there, going to a later stop; counter staff at their own terminal. Generating the voucher closes the list: the voucher's Cargo = the list's paid total, parcels become `loaded`. Bus swap moves the list; a cancelled trip voids it (parcels back to `booked`) |
+| GET | `/cargo/lists[/:id]` | S | Find cargo lists (CL number, bus, terminal, status, dates) · one list with its parcels and QR (printed list) |
+| GET · POST | `/cargo/arrivals` · `/cargo/arrivals/receive` | S | At the destination: buses bringing parcels, waiting for collection (overdue after the settings' days), today's hand-overs · tick parcels off the bus (`{ parcelIds }` or `{ parcel }`; only `loaded` parcels addressed here; all or nothing) |
+| POST | `/cargo/parcels/:id/deliver` · `/cargo/parcels/:id/return` | S | Hand over `{ proof: receiver_cnic \| slip, collectorName, collectorCnic, cashReceived }` (receiver's CNIC must match if given at booking; receiver-pays only once the money is taken, counted for this terminal) · return an uncollected parcel to the sender `{ reason }`. Counter staff: own terminal |
 | POST | `/bookings` | C, S | Hold seats → `pending` booking |
 | GET | `/bookings/me` | C | Own bookings (incl. `holdExpiresAt`, `expirySeenAt`, `paymentReceived`) |
 | POST | `/bookings/expiry-seen` | C | `{ ids: [...] }` mark "reservation expired" notice as seen |

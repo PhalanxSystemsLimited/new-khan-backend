@@ -316,6 +316,10 @@ const AUDIT_ITEM_LABEL = `CASE a.entity_type
     WHEN 'promo_code' THEN (SELECT 'Promo ' || pc.code FROM promo_codes pc WHERE pc.id::text = a.entity_id)
     WHEN 'trip_voucher' THEN (SELECT 'Voucher ' || v.voucher_no FROM trip_vouchers v WHERE v.id::text = a.entity_id)
     WHEN 'terminal_voucher' THEN (SELECT 'Voucher ' || v.voucher_no FROM terminal_vouchers v WHERE v.id::text = a.entity_id)
+    -- Cargo: from the entry's own details (no table lookup, so the log works even before the cargo migration is run)
+    WHEN 'parcel' THEN 'Parcel ' || COALESCE(a.new_data->>'parcelNo', a.entity_id)
+    WHEN 'cargo_rate' THEN 'Cargo rate #' || a.entity_id
+    WHEN 'cargo_settings' THEN 'Cargo settings'
     WHEN 'round_trip' THEN (SELECT rt.route_label || ' · ' || to_char(rt.report_date, 'DD Mon YYYY') FROM round_trips rt WHERE rt.id::text = a.entity_id)
     ELSE NULL
   END`;

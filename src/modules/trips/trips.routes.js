@@ -6,6 +6,7 @@ import { optionalAuth, requireAuth, requireRole, isStaff, ADMIN_ROLES, MANAGER_R
 import { env } from '../../config/env.js';
 import { autoCreateReport, closePreviousRoundTrip } from '../roundtrips/roundtrips.sync.js';
 import { createTripWithReturn } from './trips.create.js';
+import { cargoListsReady, voidListsForCancelledTrip } from '../cargo/cargo.lists.js';
 import { expireStaleSoon } from '../../jobs/expireBookings.js';
 import { searchLimiter } from '../../middleware/rateLimit.js';
 import { AppError } from '../../utils/AppError.js';
@@ -392,6 +393,8 @@ router.patch(
            WHERE trip_id = $1 AND status = 'generated'`,
           [id, b.reason],
         );
+        // Its cargo lists too: the parcels go back to their terminal to go on another bus.
+        if (await cargoListsReady(client)) await voidListsForCancelledTrip(client, { tripId: id, reason: b.reason ?? 'no reason given', user: req.user });
       }
       if (b.status === 'arrived') {
         await client.query(`UPDATE bookings SET status = 'completed' WHERE trip_id = $1 AND status = 'confirmed'`, [id]);

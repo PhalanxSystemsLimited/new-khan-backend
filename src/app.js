@@ -32,6 +32,7 @@ import phoneRoutes from './modules/sms/sms.routes.js';
 import { adminEmployeesRouter, crewRouter } from './modules/employees/employees.routes.js';
 import { dayPlanRouter } from './modules/dayplan/dayPlan.routes.js';
 import { homeRouter } from './modules/home/home.routes.js';
+import { cargoRouter } from './modules/cargo/cargo.routes.js';
 import { runExpiryOnce } from './jobs/expireBookings.js';
 
 export function createApp() {
@@ -154,6 +155,7 @@ export function createApp() {
   api.use('/phone', phoneRoutes);
   api.use('/admin/employees', adminEmployeesRouter);
   api.use('/admin/day-plan', dayPlanRouter);
+  api.use('/cargo', cargoRouter);
   api.use('/', homeRouter); // /counter/departures, /me/trips, /board
   api.use('/employees', crewRouter);
   api.use('/admin', adminRoutes);

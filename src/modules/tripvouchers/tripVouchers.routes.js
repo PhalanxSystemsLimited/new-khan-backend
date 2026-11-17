@@ -22,6 +22,7 @@ import {
   terminalDeductions, voucherStops,
 } from './tripVouchers.service.js';
 import { closePreviousRoundTrip } from '../roundtrips/roundtrips.sync.js';
+import { cargoListsReady, openListTotals } from '../cargo/cargo.lists.js';
 
 const router = Router();
 router.use(requireAuth, requireRole(...STAFF_ROLES));
@@ -153,11 +154,23 @@ router.get('/:id', validate({ params: bigIdParam }), async (req, res) => {
 
   const stopById = new Map(stops.map((s) => [s.id, s]));
   const cityOf = (sid) => stopById.get(sid)?.city ?? '?';
+  // Cargo lists (when the cargo tables exist): an open list's paid total is the preview's Cargo.
+  const cargoReady = await cargoListsReady();
+  const { rows: lists } = cargoReady
+    ? await query(`SELECT id, list_no, boarding_stop_id, status, parcel_count, paid_total, to_pay_total FROM cargo_lists WHERE trip_id = $1 AND status <> 'void'`, [id])
+    : { rows: [] };
   const terminals = [];
   for (const s of voucherStops(stops)) {
     const live = vouchers.find((v) => v.boardingStopId === s.id && v.status === 'generated');
     const history = vouchers.filter((v) => v.boardingStopId === s.id && v.status !== 'generated');
-    const preview = live ? null : buildSnapshot({ stops, passengers, stop: s, deductions: await terminalDeductions(s.terminalId) });
+    const l = lists.find((x) => x.boardingStopId === s.id);
+    const open = l?.status === 'open' ? await openListTotals(undefined, id, s.id) : null;
+    const cargo = !cargoReady
+      ? null
+      : l
+        ? { listId: l.id, listNo: l.listNo, status: l.status, parcelCount: open ? open.parcelCount : l.status === 'open' ? 0 : l.parcelCount, paidTotal: open ? open.paidTotal : l.status === 'open' ? 0 : l.paidTotal, toPayTotal: open ? open.toPayTotal : l.status === 'open' ? 0 : l.toPayTotal }
+        : { listId: null, parcelCount: 0, paidTotal: 0, toPayTotal: 0, status: null };
+    const preview = live ? null : buildSnapshot({ stops, passengers, stop: s, deductions: await terminalDeductions(s.terminalId), cargoAmount: cargo?.paidTotal ?? 0 });
     terminals.push({
       stopId: s.id,
       terminalId: s.terminalId,
@@ -167,6 +180,7 @@ router.get('/:id', validate({ params: bigIdParam }), async (req, res) => {
       voucher: live ?? null,
       history,
       preview,
+      cargo, // null: cargo not set up; parcelCount > 0: the voucher's Cargo comes from the list
       canGenerate: !live && canGenerateAt(req.user, s) && !['cancelled', 'arrived'].includes(trip.status),
     });
   }
@@ -240,7 +254,8 @@ router.post(
     const b = req.valid.body;
     const made = await withTransaction(async (client) => {
       const v = await generateVoucher(client, { tripId: req.valid.params.id, ...b, user: req.user });
-      await audit({ req, client, action: 'trip_voucher.generate', entityType: 'trip_voucher', entityId: v.id, newData: { voucherNo: v.voucherNo, tripId: req.valid.params.id, ...b } });
+      const fromList = v.cargoList ? { cargoAmount: v.cargoList.paidTotal, cargoListNo: v.cargoList.listNo, cargoParcels: v.cargoList.parcelCount } : {};
+      await audit({ req, client, action: 'trip_voucher.generate', entityType: 'trip_voucher', entityId: v.id, newData: { voucherNo: v.voucherNo, tripId: req.valid.params.id, ...b, ...fromList } });
       // The bus is leaving its first terminal: if that is Lahore or Multan, a round trip nobody marked as arrived is closed.
       const first = await one(`SELECT 1 FROM route_stops rs JOIN trips t ON t.route_id = rs.route_id WHERE t.id = $1 AND rs.id = $2 AND rs.stop_order = 1`, [req.valid.params.id, b.boardingStopId], client);
       if (first) await closePreviousRoundTrip(client, { tripId: req.valid.params.id, userId: req.user.id });

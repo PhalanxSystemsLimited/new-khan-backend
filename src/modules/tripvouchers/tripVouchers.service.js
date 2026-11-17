@@ -14,6 +14,7 @@ import { query, one } from '../../config/db.js';
 import { env } from '../../config/env.js';
 import { AppError } from '../../utils/AppError.js';
 import { qrSvg } from '../roundtrips/roundtrips.service.js';
+import { cargoListsReady, closeListForVoucher, moveListToVoucher, openListTotals } from '../cargo/cargo.lists.js';
 
 /** Paid seats: a ticket is only confirmed once its booking is paid; boarded and no-show were paid too. */
 export const PAID = `('confirmed', 'boarded', 'no_show')`;
@@ -210,8 +211,11 @@ export async function generateVoucher(client, { tripId, boardingStopId, loadAmou
 
   const passengers = await paidPassengers(tripId, client);
   const deductions = await terminalDeductions(stop.terminalId, client);
-  const snap = buildSnapshot({ stops, passengers, stop, deductions, loadAmount, cargoAmount });
-  return insertVoucher(client, {
+  // With a cargo list, the voucher's Cargo is the list's PAID total (not typed); the list closes with the voucher.
+  const cargoReady = await cargoListsReady(client);
+  const list = cargoReady ? await openListTotals(client, tripId, boardingStopId) : null;
+  const snap = buildSnapshot({ stops, passengers, stop, deductions, loadAmount, cargoAmount: list ? list.paidTotal : cargoAmount });
+  const voucher = await insertVoucher(client, {
     ...snap,
     tripId,
     boardingStopId,
@@ -226,6 +230,10 @@ export async function generateVoucher(client, { tripId, boardingStopId, loadAmou
     generatedBy: user.id,
     generatedByName: user.fullName || user.email || 'Staff',
   });
+  const cargoList = cargoReady
+    ? await closeListForVoucher(client, { tripId, stopId: boardingStopId, voucher, busNo: trip.registrationNo, stopCity: stop.city, user })
+    : null;
+  return { ...voucher, cargoList };
 }
 
 /** Bus swap: the voucher is replaced by a new one with the same details and the trip's current bus. */
@@ -260,6 +268,8 @@ export async function replaceVoucher(client, { voucherId, reason, user }) {
     approvedBy: user.id,
     approvedByName: who,
   });
+  // The bus's cargo list moves to the new voucher and bus.
+  if (await cargoListsReady(client)) await moveListToVoucher(client, { oldVoucherId: old.id, voucher: fresh, busNo: trip.registrationNo, user });
   return { old, fresh };
 }
 
