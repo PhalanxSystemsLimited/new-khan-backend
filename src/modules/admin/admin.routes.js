@@ -26,10 +26,14 @@ router.get('/routes', async (_req, res) => {
   const { rows } = await query(
     `SELECT r.id, r.code, r.name, r.distance_km, r.est_duration_minutes, r.is_active,
             ot.name AS origin_terminal, dt.name AS destination_terminal,
+            ot.city_id AS origin_city_id, dt.city_id AS destination_city_id,
+            oc.name AS origin_city, dc.name AS destination_city,
             (SELECT count(*) FROM route_stops rs WHERE rs.route_id = r.id)::int AS stop_count
      FROM routes r
      JOIN terminals ot ON ot.id = r.origin_terminal_id
      JOIN terminals dt ON dt.id = r.destination_terminal_id
+     JOIN cities oc ON oc.id = ot.city_id
+     JOIN cities dc ON dc.id = dt.city_id
      ORDER BY r.is_active DESC, r.name`,
   );
   res.json({ data: rows });

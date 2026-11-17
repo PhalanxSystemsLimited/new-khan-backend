@@ -488,7 +488,7 @@ Access: **public**, **C** = any signed-in user, **owner** = the booking's custom
 | GET | `/trips/search?fromCityId&toCityId&date&passengers&busClass` | public | Search trips |
 | GET | `/trips/:id` · `/trips/:id/seats` | public | Trip details, seat map (no passenger data) |
 | GET | `/trips?date=` · `/trips/:id/manifest` | S | Operations |
-| POST · PATCH | `/trips` · `/trips/:id/assignment` | A | Ad-hoc trips, bus/crew assignment |
+| POST · PATCH | `/trips` · `/trips/:id/assignment` | A | Ad-hoc trips (optional `returnTrip: { routeId, departureAt, driverId? }` adds the same bus's return trip: both or neither; it must start where the bus arrives and leave after it arrives), bus/crew assignment |
 | PATCH | `/trips/:id/status` | S (cancel = A) | boarding / departed / arrived / delayed / cancelled |
 | POST | `/bookings` | C, S | Hold seats → `pending` booking |
 | GET | `/bookings/me` | C | Own bookings (incl. `holdExpiresAt`, `expirySeenAt`, `paymentReceived`) |

@@ -5,6 +5,7 @@ import { validate } from '../../middleware/validate.js';
 import { optionalAuth, requireAuth, requireRole, isStaff, ADMIN_ROLES, MANAGER_ROLES, STAFF_ROLES } from '../../middleware/auth.js';
 import { env } from '../../config/env.js';
 import { autoCreateReport, closePreviousRoundTrip } from '../roundtrips/roundtrips.sync.js';
+import { createTripWithReturn } from './trips.create.js';
 import { expireStaleSoon } from '../../jobs/expireBookings.js';
 import { searchLimiter } from '../../middleware/rateLimit.js';
 import { AppError } from '../../utils/AppError.js';
@@ -142,6 +143,8 @@ const tripCreateSchema = z
     departureAt: isoDateTime,
     // Kept for older clients; online booking now closes ONLINE_CUTOFF_MINUTES before the bus reaches each terminal.
     bookingCloseMinutes: z.number().int().min(0).max(720).default(60),
+    // Optional: the same bus comes back (one-off form, "Also add the return trip").
+    returnTrip: z.object({ routeId: intId, departureAt: isoDateTime, driverId: intId.optional() }).strict().optional(),
   })
   .strict()
   .refine((t) => !t.coDriverId || t.coDriverId !== t.driverId, 'Driver and co-driver must differ');
@@ -184,29 +187,13 @@ router.post('/', ...admin, validate({ body: tripCreateSchema }), async (req, res
   const b = req.valid.body;
   if (Date.parse(b.departureAt) <= Date.now()) throw AppError.badRequest('Departure must be in the future');
 
-  const trip = await withTransaction(async (client) => {
-    const route = await one(`SELECT est_duration_minutes FROM routes WHERE id = $1 AND is_active`, [b.routeId], client);
-    if (!route?.estDurationMinutes) throw AppError.badRequest('Route not found, inactive, or missing duration');
-    const bus = await one(`SELECT id FROM buses WHERE id = $1 AND is_active FOR UPDATE`, [b.busId], client);
-    if (!bus) throw AppError.badRequest('Bus not found or inactive');
-
-    const arrivalAt = new Date(Date.parse(b.departureAt) + route.estDurationMinutes * 60_000).toISOString();
-    await assertBusFree(client, b.busId, b.departureAt, arrivalAt);
-    await assertDriversValid(client, [b.driverId, b.coDriverId]);
-    await assertConductorValid(client, b.conductorId);
-
-    const trip = await one(
-      `INSERT INTO trips (route_id, bus_id, driver_id, co_driver_id, hostess_name, departure_at, arrival_at, booking_closes_at)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $6::timestamptz - make_interval(mins => $8)) RETURNING *`,
-      [b.routeId, b.busId, b.driverId ?? null, b.coDriverId ?? null, b.hostessName ?? null, b.departureAt, arrivalAt, b.bookingCloseMinutes],
-      client,
-    );
-    // Separate statement so creating trips keeps working on a database without the conductor column.
-    if (b.conductorId) return one(`UPDATE trips SET conductor_id = $2 WHERE id = $1 RETURNING *`, [trip.id, b.conductorId], client);
-    return trip;
-  });
+  // With `returnTrip`, the same bus's return trip is created too: both or neither (see trips.create.js).
+  const { trip, returnTrip, warnings } = await withTransaction((client) => createTripWithReturn(client, b));
   await audit({ req, action: 'trip.create', entityType: 'trip', entityId: trip.id, newData: trip });
-  res.status(201).json({ data: trip });
+  if (returnTrip) {
+    await audit({ req, action: 'trip.create', entityType: 'trip', entityId: returnTrip.id, newData: { ...returnTrip, returnOfTripId: trip.id } });
+  }
+  res.status(201).json({ data: trip, returnTrip, warnings });
 });
 
 router.get(
