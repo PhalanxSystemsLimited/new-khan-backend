@@ -247,6 +247,7 @@ export async function buildReport(id, { admin = false, scannedVoucherId = null, 
       legRef: leg.legRef,
       tripId: leg.tripId ?? null,
       passengers: leg.passengers,
+      totals: leg.totals,
       rows: leg.rows.map((r) => ({
         voucherId: r.id,
         voucherNo: r.voucherNo,

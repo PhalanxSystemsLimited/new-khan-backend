@@ -484,7 +484,7 @@ Access: **public**, **C** = any signed-in user, **owner** = the booking's custom
 | GET | `/fares?routeId=` | public | Fare table |
 | POST/PATCH | `/fares[/:id]` | A | Manage fares |
 | GET/POST/PATCH | `/schedules[/:id]` | S read · A write | Timetables |
-| POST | `/schedules/:id/generate-trips` | A | Create dated trips (≤ 92 days, safe to re-run) |
+| POST | `/schedules/:id/generate-trips` | A | Create dated trips (≤ 92 days, safe to re-run). Days when the default bus is already on an overlapping trip are skipped and returned in `skipped` (with the clashing trip); `alreadyThere` counts days that had the trip |
 | GET | `/trips/search?fromCityId&toCityId&date&passengers&busClass` | public | Search trips |
 | GET | `/trips/:id` · `/trips/:id/seats` | public | Trip details, seat map (no passenger data) |
 | GET | `/trips?date=` · `/trips/:id/manifest` | S | Operations |

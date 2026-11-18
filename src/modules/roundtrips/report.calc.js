@@ -54,9 +54,19 @@ export function computeReport(t, { legs, vouchers, fuel, offroute }) {
     };
   });
 
+  const columnTotals = (list) => ({
+    paxTerminal: sum(list, (r) => r.paxTerminal),
+    paxEnroute: sum(list, (r) => r.paxEnroute),
+    incTerminal: sum(list, (r) => r.incTerminal),
+    incEnroute: sum(list, (r) => r.incEnroute),
+    incOnline: sum(list, (r) => r.incOnline),
+    totalSale: sum(list, (r) => r.totalSale),
+  });
+
   const legBlocks = legs.map((leg) => {
     const legRows = rows.filter((r) => r.legId === leg.id);
-    return { ...leg, rows: legRows, passengers: sum(legRows, (r) => r.paxTerminal + r.paxEnroute) };
+    // `totals` = the leg's sub-total row on the sheet (the trip total is the same sums over every row).
+    return { ...leg, rows: legRows, passengers: sum(legRows, (r) => r.paxTerminal + r.paxEnroute), totals: columnTotals(legRows) };
   });
 
   const A = sum(rows, (r) => r.totalSale);

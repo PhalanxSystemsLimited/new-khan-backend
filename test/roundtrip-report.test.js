@@ -21,6 +21,18 @@ test('Trip 24319 acceptance figures', () => {
   assert.deepEqual(r.legs[1].rows.map((x) => x.totalSale), [57_200, 14_800, 15_000]);
   assert.equal(r.legs[0].passengers, 47);
   assert.equal(r.legs[1].passengers, 66);
+
+  // Leg sub-totals: each leg's column sums, and the two legs add up to the trip total.
+  for (const leg of r.legs) {
+    for (const k of ['paxTerminal', 'paxEnroute', 'incTerminal', 'incEnroute', 'incOnline', 'totalSale']) {
+      assert.equal(leg.totals[k], leg.rows.reduce((s, x) => s + x[k], 0), `${leg.title} ${k}`);
+    }
+    assert.equal(leg.totals.paxTerminal + leg.totals.paxEnroute, leg.passengers);
+  }
+  assert.deepEqual(r.legs.map((l) => l.totals.totalSale), [99_900, 87_000]);
+  for (const k of ['paxTerminal', 'paxEnroute', 'incTerminal', 'incEnroute', 'incOnline', 'totalSale']) {
+    assert.equal(r.legs[0].totals[k] + r.legs[1].totals[k], r.totals[k], `trip ${k}`);
+  }
   assert.deepEqual(
     { ...r.totals, avgKm: r.totals.avgKm },
     {

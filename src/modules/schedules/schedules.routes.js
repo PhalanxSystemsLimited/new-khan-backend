@@ -1,6 +1,6 @@
 import { Router } from 'express';
 import { z } from 'zod';
-import { query, one } from '../../config/db.js';
+import { query, one, withTransaction } from '../../config/db.js';
 import { validate } from '../../middleware/validate.js';
 import { requireAuth, requireRole, ADMIN_ROLES, STAFF_ROLES } from '../../middleware/auth.js';
 import { AppError } from '../../utils/AppError.js';
@@ -80,6 +80,7 @@ router.patch(
 /**
  * Create dated trips from a schedule for a date range (max 92 days).
  * Existing trips for the same schedule/time are skipped, so this is safe to re-run.
+ * Days when the default bus is already on another trip are skipped and listed in `skipped`.
  */
 router.post(
   '/:id/generate-trips',
@@ -103,21 +104,41 @@ router.post(
     const { id } = req.valid.params;
     const { fromDate, toDate, bookingCloseMinutes } = req.valid.body;
 
-    const sched = await one(
-      `SELECT s.id, s.default_bus_id, s.is_active, r.est_duration_minutes
-       FROM schedules s JOIN routes r ON r.id = s.route_id WHERE s.id = $1`,
-      [id],
-    );
-    if (!sched) throw AppError.notFound('Schedule not found');
-    if (!sched.isActive) throw AppError.unprocessable('Schedule is inactive');
-    if (!sched.defaultBusId) throw AppError.unprocessable('Assign a default bus to the schedule first');
-    if (!sched.estDurationMinutes) throw AppError.unprocessable('Route has no estimated duration');
+    const result = await withTransaction((client) => generateTrips(client, id, fromDate, toDate, bookingCloseMinutes));
+    await audit({
+      req, action: 'schedule.generate_trips', entityType: 'schedule', entityId: id,
+      newData: { fromDate, toDate, created: result.created, alreadyThere: result.alreadyThere, skippedBusBusy: result.skipped.map((s) => s.date) },
+    });
+    res.status(201).json({ data: result });
+  },
+);
 
-    const { rows } = await query(
-      `INSERT INTO trips (schedule_id, route_id, bus_id, departure_at, arrival_at, booking_closes_at)
-       SELECT s.id, s.route_id, s.default_bus_id, x.dep,
-              x.dep + make_interval(mins => r.est_duration_minutes),
-              x.dep - make_interval(mins => $4)
+/**
+ * The work behind "Create trips". Each running day in the range is one of:
+ *  - already there (this schedule already has that trip): left alone;
+ *  - bus busy (the default bus is on another trip that overlaps): skipped and reported, so staff can
+ *    add that day with another bus;
+ *  - created.
+ */
+export async function generateTrips(client, id, fromDate, toDate, bookingCloseMinutes) {
+  const sched = await one(
+    `SELECT s.id, s.default_bus_id, s.is_active, r.est_duration_minutes
+     FROM schedules s JOIN routes r ON r.id = s.route_id WHERE s.id = $1`,
+    [id],
+    client,
+  );
+  if (!sched) throw AppError.notFound('Schedule not found');
+  if (!sched.isActive) throw AppError.unprocessable('Schedule is inactive');
+  if (!sched.defaultBusId) throw AppError.unprocessable('Assign a default bus to the schedule first');
+  if (!sched.estDurationMinutes) throw AppError.unprocessable('Route has no estimated duration');
+
+  // Lock the bus so two "Create trips" runs for the same bus can't both see it free.
+  const bus = await one('SELECT id, registration_no, is_active FROM buses WHERE id = $1 FOR UPDATE', [sched.defaultBusId], client);
+  if (!bus?.isActive) throw AppError.unprocessable(`The default bus${bus ? ` ${bus.registrationNo}` : ''} is inactive. Choose another bus for the schedule first.`);
+
+  const { rows: days } = await query(
+    `WITH cand AS (
+       SELECT g.d::date AS day, x.dep, x.dep + make_interval(mins => r.est_duration_minutes) AS arr
        FROM schedules s
        JOIN routes r ON r.id = s.route_id
        CROSS JOIN LATERAL generate_series($2::date, $3::date, interval '1 day') AS g(d)
@@ -127,13 +148,58 @@ router.post(
          AND g.d::date >= s.effective_from
          AND (s.effective_to IS NULL OR g.d::date <= s.effective_to)
          AND x.dep > now()
+     )
+     SELECT to_char(c.day, 'YYYY-MM-DD') AS day, c.dep, c.arr,
+            EXISTS (SELECT 1 FROM trips t WHERE t.schedule_id = $1 AND t.departure_at = c.dep) AS already_there,
+            k.id AS clash_trip_id, k.route_name AS clash_route, k.departure_at AS clash_departure_at
+     FROM cand c
+     LEFT JOIN LATERAL (
+       SELECT t.id, rr.name AS route_name, t.departure_at
+       FROM trips t JOIN routes rr ON rr.id = t.route_id
+       WHERE t.bus_id = $4 AND t.status NOT IN ('cancelled', 'arrived')
+         AND tstzrange(t.departure_at, t.arrival_at) && tstzrange(c.dep, c.arr)
+       ORDER BY t.departure_at LIMIT 1
+     ) k ON TRUE
+     ORDER BY c.dep`,
+    [id, fromDate, toDate, sched.defaultBusId],
+    client,
+  );
+
+  const toCreate = [];
+  const skipped = [];
+  let alreadyThere = 0;
+  let lastArr = null; // a route longer than a day would make this run's own trips overlap
+  for (const d of days) {
+    if (d.alreadyThere) { alreadyThere += 1; continue; }
+    if (d.clashTripId) {
+      skipped.push({ date: d.day, departureAt: d.dep, clashTripId: d.clashTripId, clashRoute: d.clashRoute, clashDepartureAt: d.clashDepartureAt });
+      continue;
+    }
+    if (lastArr && new Date(d.dep) < lastArr) {
+      skipped.push({ date: d.day, departureAt: d.dep, clashTripId: null, clashRoute: null, clashDepartureAt: null });
+      continue;
+    }
+    toCreate.push(d.dep);
+    lastArr = new Date(d.arr);
+  }
+
+  let trips = [];
+  if (toCreate.length) {
+    ({ rows: trips } = await query(
+      `INSERT INTO trips (schedule_id, route_id, bus_id, departure_at, arrival_at, booking_closes_at)
+       SELECT s.id, s.route_id, s.default_bus_id, d.dep,
+              d.dep + make_interval(mins => r.est_duration_minutes),
+              d.dep - make_interval(mins => $3)
+       FROM schedules s JOIN routes r ON r.id = s.route_id
+       CROSS JOIN unnest($2::timestamptz[]) AS d(dep)
+       WHERE s.id = $1
        ON CONFLICT (schedule_id, departure_at) WHERE schedule_id IS NOT NULL DO NOTHING
        RETURNING id, departure_at`,
-      [id, fromDate, toDate, bookingCloseMinutes],
-    );
-    await audit({ req, action: 'schedule.generate_trips', entityType: 'schedule', entityId: id, newData: { fromDate, toDate, created: rows.length } });
-    res.status(201).json({ data: { created: rows.length, trips: rows } });
-  },
-);
+      [id, toCreate, bookingCloseMinutes],
+      client,
+    ));
+  }
+  return { created: trips.length, trips, alreadyThere, bus: bus.registrationNo, skipped };
+}
 
 export default router;
