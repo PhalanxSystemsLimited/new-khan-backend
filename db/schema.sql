@@ -344,6 +344,7 @@ CREATE TABLE bookings (
     notes               TEXT,
     created_at          TIMESTAMPTZ NOT NULL DEFAULT now(),
     updated_at          TIMESTAMPTZ NOT NULL DEFAULT now(),
+    ticket_token        UUID NOT NULL DEFAULT gen_random_uuid(),   -- random code in the ticket's QR (/t/<token>); not the PNR or id
     CONSTRAINT bookings_stops_distinct CHECK (boarding_stop_id <> dropping_stop_id),
     CONSTRAINT bookings_discount_le_subtotal CHECK (discount_amount <= subtotal),
     CONSTRAINT bookings_holder_cnic_format CHECK (holder_cnic IS NULL OR holder_cnic ~ '^[0-9]{13}$')
@@ -352,6 +353,7 @@ CREATE INDEX bookings_user_idx      ON bookings (user_id, created_at DESC);
 CREATE INDEX bookings_trip_idx      ON bookings (trip_id);
 CREATE INDEX bookings_phone_idx     ON bookings (contact_phone);
 CREATE INDEX bookings_pending_idx   ON bookings (hold_expires_at) WHERE status = 'pending';
+CREATE UNIQUE INDEX bookings_ticket_token_uq ON bookings (ticket_token);
 
 -- One row per passenger / seat
 CREATE TABLE tickets (

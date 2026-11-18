@@ -507,6 +507,7 @@ Access: **public**, **C** = any signed-in user, **owner** = the booking's custom
 | GET | `/bookings/:id` · `/bookings/:id/cancel-quote` | owner, S | Details, refund preview |
 | POST | `/bookings/:id/cancel` · `/bookings/:id/review` | owner, S | Cancel / review a completed trip |
 | POST | `/tickets/:id/board` | S | Mark passenger boarded |
+| GET | `/tickets/check/:token` | – | The page a ticket's QR opens (`APP_URL/t/<token>`). Anyone: state (valid / completed / cancelled / unpaid / expired), journey, seats and names. Signed-in employees also get contact, masked CNIC, payment and boarding. Read only. Needs migration `2026-11-20-ticket-qr.sql` (`bookings.ticket_token`, a random UUID, not the PNR or id); before it runs, tickets have no QR and this answers 404 |
 | POST | `/payments/intent` (+ `Idempotency-Key`) | owner | Start an online payment |
 | POST | `/payments/cash` | S | Cash payment at the counter |
 | POST | `/payments/webhook/:gateway` | signed | Gateway callback (`safepay`) |

@@ -2,7 +2,7 @@ import { Router } from 'express';
 import { z } from 'zod';
 import { query, one } from '../../config/db.js';
 import { validate } from '../../middleware/validate.js';
-import { requireAuth, requireRole, STAFF_ROLES, isStaff } from '../../middleware/auth.js';
+import { optionalAuth, requireAuth, requireRole, STAFF_ROLES, isStaff } from '../../middleware/auth.js';
 import { bookingLimiter, lookupLimiter, otpLimiter } from '../../middleware/rateLimit.js';
 import { AppError } from '../../utils/AppError.js';
 import { audit } from '../../utils/audit.js';
@@ -15,6 +15,7 @@ import {
   sendCounterCode,
 } from './bookings.service.js';
 import { reconcileSafepayBooking } from '../payments/payments.routes.js';
+import { checkTicket, ticketQrFor } from './ticketQr.js';
 
 const router = Router();
 
@@ -173,6 +174,7 @@ router.get(
         currency: b.currency,
         paymentReceived: Boolean(paid),
         tickets: b.tickets.map((t) => ({ ticketNo: t.ticketNo, seatNumber: t.seatNumber, passengerName: t.passengerName, status: t.status })),
+        ticketQr: await ticketQrFor(b),
       },
     });
   },
@@ -221,7 +223,7 @@ router.get('/:id', requireAuth, validate({ params: uuidParam }), async (req, res
     await reconcileSafepayBooking(booking.id);
     booking = await getBookingDetail(booking.id);
   }
-  res.json({ data: booking });
+  res.json({ data: { ...booking, ticketQr: await ticketQrFor(booking) } });
 });
 
 /**
@@ -337,6 +339,17 @@ router.post(
 
 // ---- Tickets (boarding) ----
 export const ticketsRouter = Router();
+
+/**
+ * The page a ticket's QR code opens (/t/<token>). Anyone: valid or not, the journey and seats. Signed-in New Khan
+ * staff: also contact, payment and boarding details. Read only. See ticketQr.js.
+ */
+ticketsRouter.get('/check/:token', optionalAuth, validate({ params: z.object({ token: uuid }).strict() }), async (req, res) => {
+  const t = await checkTicket(req.valid.params.token, req.user);
+  if (!t) throw AppError.notFound('No ticket found for this code.');
+  res.set('Cache-Control', 'no-store');
+  res.json({ data: t });
+});
 
 ticketsRouter.post(
   '/:id/board',
