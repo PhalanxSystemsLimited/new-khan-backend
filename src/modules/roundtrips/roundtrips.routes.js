@@ -674,9 +674,46 @@ reportSettingsRouter.get('/terminal-deductions', async (_req, res) => {
 
 reportSettingsRouter.put(
   '/terminal-deductions',
-  validate({ body: z.object({ terminalId: intId, categoryId: intId, amount: rupees }).strict() }),
+  validate({ body: z.object({ terminalId: intId, categoryId: intId, amount: rupees, allTerminals: z.boolean().optional() }).strict() }),
   async (req, res) => {
     const b = req.valid.body;
+    if (b.allTerminals) {
+      // The whole column: every active terminal gets this amount, all or nothing. One Activity log entry per
+      // terminal whose amount actually changed (the same entries as editing each cell by hand).
+      const out = await withTransaction(async (client) => {
+        const cat = await one(`SELECT name FROM onroute_categories WHERE id = $1`, [b.categoryId], client);
+        if (!cat) throw AppError.notFound('Terminal or deduction not found');
+        const { rows: terms } = await query(
+          `SELECT t.id, c.name || ' · ' || t.name AS label, d.amount AS before
+           FROM terminals t JOIN cities c ON c.id = t.city_id
+           LEFT JOIN terminal_deductions d ON d.terminal_id = t.id AND d.category_id = $1
+           WHERE t.is_active
+           ORDER BY c.name, t.name
+           FOR UPDATE OF t`,
+          [b.categoryId],
+          client,
+        );
+        let changed = 0;
+        for (const t of terms) {
+          if (t.before === b.amount) continue;
+          const r = await one(
+            `INSERT INTO terminal_deductions (terminal_id, category_id, amount, updated_by, updated_at) VALUES ($1, $2, $3, $4, now())
+             ON CONFLICT ON CONSTRAINT terminal_deductions_uq
+             DO UPDATE SET amount = EXCLUDED.amount, updated_by = EXCLUDED.updated_by, updated_at = now() RETURNING id`,
+            [t.id, b.categoryId, b.amount, req.user.id],
+            client,
+          );
+          await audit({
+            req, client, action: 'terminal_deduction.set', entityType: 'terminal_deduction', entityId: r.id,
+            oldData: t.before === null ? null : { terminal: t.label, deduction: cat.name, amount: t.before },
+            newData: { terminal: t.label, deduction: cat.name, amount: b.amount, appliedToAllTerminals: true },
+          });
+          changed += 1;
+        }
+        return { deduction: cat.name, amount: b.amount, terminals: terms.length, changed };
+      });
+      return res.json({ data: out });
+    }
     const row = await withTransaction(async (client) => {
       const names = await one(
         `SELECT (SELECT c.name || ' · ' || t.name FROM terminals t JOIN cities c ON c.id = t.city_id WHERE t.id = $1) AS terminal,
