@@ -5,7 +5,8 @@ import { validate } from '../../middleware/validate.js';
 import { optionalAuth, requireAuth, requireRole, isStaff, ADMIN_ROLES, MANAGER_ROLES, STAFF_ROLES } from '../../middleware/auth.js';
 import { env } from '../../config/env.js';
 import { autoCreateReport, closePreviousRoundTrip } from '../roundtrips/roundtrips.sync.js';
-import { createTripWithReturn } from './trips.create.js';
+import { assertBusFree, createExtraDeparture, createTripWithReturn } from './trips.create.js';
+import { busConfirmReady, confirmedSql, CONFIRM_FIRST } from './busConfirm.js';
 import { cargoListsReady, voidListsForCancelledTrip } from '../cargo/cargo.lists.js';
 import { expireStaleSoon } from '../../jobs/expireBookings.js';
 import { searchLimiter } from '../../middleware/rateLimit.js';
@@ -17,7 +18,6 @@ import { seatOrder } from '../../utils/seats.js';
 const router = Router();
 const admin = [requireAuth, requireRole(...ADMIN_ROLES)];
 const staff = [requireAuth, requireRole(...STAFF_ROLES)];
-const manager = [requireAuth, requireRole(...MANAGER_ROLES)];
 
 const ACTIVE_TICKET = `('held','reserved','confirmed','boarded')`;
 
@@ -98,6 +98,86 @@ router.get('/search', searchLimiter, optionalAuth, validate({ query: searchSchem
   res.json({ data: rows });
 });
 
+// ---------------- Staff: extra departures and bus choice ----------------
+
+/**
+ * For "Add extra departure": the routes (counter staff: only those leaving from their terminal; managers: all, or
+ * those leaving from ?terminalId), the seat types (layout + class) of the active fleet, and the active buses.
+ */
+router.get(
+  '/extra-options',
+  ...staff,
+  validate({ query: z.object({ terminalId: intId.optional() }).strict() }),
+  async (req, res) => {
+    const counter = !MANAGER_ROLES.includes(req.user.role);
+    if (counter && !req.user.terminalId) throw AppError.badRequest('Your account has no terminal. Ask an admin to set one.');
+    const from = counter ? req.user.terminalId : req.valid.query.terminalId ?? null;
+    const [routes, busTypes, buses] = await Promise.all([
+      query(
+        `SELECT r.id, r.code, r.name, r.est_duration_minutes, r.origin_terminal_id, oc.name AS from_city
+         FROM routes r JOIN terminals ot ON ot.id = r.origin_terminal_id JOIN cities oc ON oc.id = ot.city_id
+         WHERE r.is_active AND r.est_duration_minutes > 0 AND ($1::int IS NULL OR r.origin_terminal_id = $1)
+         ORDER BY r.name`,
+        [from],
+      ),
+      query(
+        `SELECT b.layout_id, l.name AS layout_name, l.total_seats, b.bus_class::text AS bus_class, count(*)::int AS buses
+         FROM buses b JOIN seat_layouts l ON l.id = b.layout_id
+         WHERE b.is_active GROUP BY b.layout_id, l.name, l.total_seats, b.bus_class ORDER BY l.total_seats DESC, b.bus_class`,
+      ),
+      query(
+        `SELECT b.id, b.registration_no, b.fleet_no, b.layout_id, b.bus_class::text AS bus_class, l.name AS layout_name
+         FROM buses b JOIN seat_layouts l ON l.id = b.layout_id WHERE b.is_active ORDER BY b.fleet_no NULLS LAST, b.id`,
+      ),
+    ]);
+    res.set('Cache-Control', 'no-store');
+    res.json({ data: { routes: routes.rows, busTypes: busTypes.rows, buses: buses.rows, plannedAllowed: await busConfirmReady() } });
+  },
+);
+
+/**
+ * Buses that can go on this trip (Bus & crew): active, the same seat layout as the trip's bus, each with the
+ * confirmed trip it is busy on at that time (busyTripId), if any.
+ */
+router.get('/:id/bus-options', ...staff, validate({ params: bigIdParam }), async (req, res) => {
+  const t = await one(
+    `SELECT t.id, t.departure_at, t.arrival_at, b.layout_id FROM trips t JOIN buses b ON b.id = t.bus_id WHERE t.id = $1`,
+    [req.valid.params.id],
+  );
+  if (!t) throw AppError.notFound('Trip not found');
+  const confirmed = await confirmedSql('o');
+  const { rows } = await query(
+    `SELECT b.id, b.registration_no, b.fleet_no, b.bus_class::text AS bus_class,
+            (SELECT o.id FROM trips o
+             WHERE o.bus_id = b.id AND o.id <> $1 AND o.status NOT IN ('cancelled', 'arrived') AND ${confirmed}
+               AND tstzrange(o.departure_at, o.arrival_at) && tstzrange($3::timestamptz, $4::timestamptz)
+             ORDER BY o.departure_at LIMIT 1) AS busy_trip_id
+     FROM buses b WHERE b.is_active AND b.layout_id = $2
+     ORDER BY b.fleet_no NULLS LAST, b.id`,
+    [t.id, t.layoutId, t.departureAt, t.arrivalAt],
+  );
+  res.set('Cache-Control', 'no-store');
+  res.json({ data: rows });
+});
+
+const extraSchema = z
+  .object({
+    routeId: intId,
+    departureAt: isoDateTime,
+    layoutId: intId.optional(),
+    busClass: busClass.optional(),
+    busId: intId.optional(),
+    allowNear: z.boolean().optional(),
+  })
+  .strict();
+
+/** An extra departure for one day (busy days), on sale at once. See createExtraDeparture. */
+router.post('/extra', ...staff, validate({ body: extraSchema }), async (req, res) => {
+  const { trip, planned } = await withTransaction((client) => createExtraDeparture(client, req.valid.body, req.user));
+  await audit({ req, action: 'trip.create_extra', entityType: 'trip', entityId: trip.id, newData: { ...trip, plannedBus: planned } });
+  res.status(201).json({ data: trip, planned });
+});
+
 // ---------------- Public: trip detail & seat map ----------------
 router.get('/:id', validate({ params: bigIdParam }), async (req, res) => {
   const trip = await one(
@@ -151,19 +231,6 @@ const tripCreateSchema = z
   .strict()
   .refine((t) => !t.coDriverId || t.coDriverId !== t.driverId, 'Driver and co-driver must differ');
 
-async function assertBusFree(client, busId, departureAt, arrivalAt, excludeTripId = null) {
-  const clash = await one(
-    `SELECT id FROM trips
-     WHERE bus_id = $1 AND status NOT IN ('cancelled', 'arrived')
-       AND tstzrange(departure_at, arrival_at) && tstzrange($2::timestamptz, $3::timestamptz)
-       AND ($4::bigint IS NULL OR id <> $4)
-     LIMIT 1`,
-    [busId, departureAt, arrivalAt, excludeTripId],
-    client,
-  );
-  if (clash) throw AppError.conflict(`Bus is already assigned to trip ${clash.id} at that time`);
-}
-
 async function assertDriversValid(client, ids) {
   for (const id of ids.filter(Boolean)) {
     const d = await one(`SELECT is_active, license_expiry >= CURRENT_DATE AS valid FROM drivers WHERE id = $1`, [id], client);
@@ -212,8 +279,10 @@ router.get(
   }),
   async (req, res) => {
     const q = req.valid.query;
+    const confirmed = await confirmedSql('t');
     const { rows } = await query(
-      `SELECT t.*, r.name AS route_name, b.registration_no, d.full_name AS driver_name,
+      `SELECT t.*, ${confirmed} AS bus_confirmed, r.name AS route_name, r.origin_terminal_id,
+              b.registration_no, b.fleet_no, b.layout_id, b.bus_class, d.full_name AS driver_name,
               cn.full_name AS conductor_name, si.full_name AS stand_in_conductor_name,
               (SELECT count(*) FROM tickets tk WHERE tk.trip_id = t.id AND tk.status IN ${ACTIVE_TICKET})::int AS seats_taken,
               (SELECT count(*) FROM trip_vouchers tv WHERE tv.trip_id = t.id AND tv.status = 'generated')::int AS vouchers_generated,
@@ -239,10 +308,14 @@ router.get(
   },
 );
 
-/** Assign bus / crew. Bus change is only allowed if the new bus uses the same seat layout. */
+/**
+ * Assign bus / crew. Saving with a bus CONFIRMS it (busConfirm.js): the planned bus or another one. A different bus
+ * must have the same seat layout (passengers keep their seat numbers) and must not be on another confirmed trip.
+ * Counter staff: only departures leaving from their own terminal, before the bus leaves, and not the stand-in.
+ */
 router.patch(
   '/:id/assignment',
-  ...manager,
+  ...staff,
   validate({
     params: bigIdParam,
     body: z
@@ -261,13 +334,25 @@ router.patch(
   async (req, res) => {
     const { id } = req.valid.params;
     const b = req.valid.body;
+    const counter = !MANAGER_ROLES.includes(req.user.role);
+    const warnings = [];
     const trip = await withTransaction(async (client) => {
+      const confirmed = await confirmedSql('t', client);
       const t = await one(
-        `SELECT t.*, bu.layout_id FROM trips t JOIN buses bu ON bu.id = t.bus_id WHERE t.id = $1 FOR UPDATE OF t`,
+        `SELECT t.*, ${confirmed} AS bus_confirmed, bu.layout_id, bu.bus_class, bu.registration_no, r.origin_terminal_id
+         FROM trips t JOIN buses bu ON bu.id = t.bus_id JOIN routes r ON r.id = t.route_id
+         WHERE t.id = $1 FOR UPDATE OF t`,
         [id],
         client,
       );
       if (!t) throw AppError.notFound('Trip not found');
+      if (counter) {
+        if (!req.user.terminalId || req.user.terminalId !== t.originTerminalId) {
+          throw AppError.forbidden('Counter staff can only set the bus and crew of departures leaving from their own terminal.');
+        }
+        if (b.standInConductorId !== undefined) throw AppError.forbidden('Only a manager or admin can record a stand-in conductor.');
+        if (!['scheduled', 'delayed', 'boarding'].includes(t.status)) throw AppError.conflict(`Trip is already ${t.status}.`);
+      }
       if (t.status === 'cancelled') throw AppError.conflict('Trip is cancelled');
       if (['departed', 'arrived'].includes(t.status)) {
         // After departure only the stand-in conductor may still be recorded (meeting, 35).
@@ -285,25 +370,35 @@ router.patch(
         );
       }
 
-      if (b.busId && b.busId !== t.busId) {
-        const nb = await one(`SELECT layout_id FROM buses WHERE id = $1 AND is_active`, [b.busId], client);
-        if (!nb) throw AppError.badRequest('Bus not found or inactive');
+      // A different bus, or confirming the planned one: check it (locked, so two saves can't both find it free).
+      const confirming = Boolean(b.busId) && !t.busConfirmed;
+      if (b.busId && (b.busId !== t.busId || confirming)) {
+        const nb = await one(`SELECT layout_id, bus_class, registration_no FROM buses WHERE id = $1 AND is_active FOR UPDATE`, [b.busId], client);
+        if (!nb) throw AppError.badRequest(b.busId === t.busId ? `Bus ${t.registrationNo} is inactive: choose another bus` : 'Bus not found or inactive');
         if (nb.layoutId !== t.layoutId) throw AppError.conflict('Replacement bus must have the same seat layout');
-        await assertBusFree(client, b.busId, t.departureAt, t.arrivalAt, id);
+        await assertBusFree(client, b.busId, t.departureAt, t.arrivalAt, '', id);
+        if (nb.busClass !== t.busClass) {
+          warnings.push(`Bus ${nb.registrationNo} is ${nb.busClass}; the tickets on this trip were sold at ${t.busClass} fares.`);
+        }
       }
       const driverId = b.driverId !== undefined ? b.driverId : t.driverId;
       const coDriverId = b.coDriverId !== undefined ? b.coDriverId : t.coDriverId;
       if (driverId && coDriverId && driverId === coDriverId) throw AppError.badRequest('Driver and co-driver must differ');
       await assertDriversValid(client, [b.driverId, b.coDriverId]);
 
-      return one(
+      const updated = await one(
         `UPDATE trips SET bus_id = $2, driver_id = $3, co_driver_id = $4, hostess_name = $5 WHERE id = $1 RETURNING *`,
         [id, b.busId ?? t.busId, driverId, coDriverId, b.hostessName !== undefined ? b.hostessName : t.hostessName],
         client,
       );
+      // Saving with a bus confirms it.
+      if (b.busId && (await busConfirmReady(client))) {
+        return one(`UPDATE trips SET bus_confirmed = TRUE WHERE id = $1 RETURNING *`, [id], client);
+      }
+      return updated;
     });
     await audit({ req, action: 'trip.assignment', entityType: 'trip', entityId: id, newData: b });
-    res.json({ data: trip });
+    res.json({ data: trip, warnings });
   },
 );
 
@@ -339,8 +434,9 @@ router.patch(
     }
 
     const result = await withTransaction(async (client) => {
+      const confirmed = await confirmedSql('t', client);
       const t = await one(
-        `SELECT t.id, t.status, t.conductor_id, t.stand_in_conductor_id, r.destination_terminal_id
+        `SELECT t.id, t.status, t.conductor_id, t.stand_in_conductor_id, r.destination_terminal_id, ${confirmed} AS bus_confirmed
          FROM trips t JOIN routes r ON r.id = t.route_id WHERE t.id = $1 FOR UPDATE OF t`,
         [id],
         client,
@@ -355,7 +451,10 @@ router.patch(
       if (t.status !== b.status && !TRANSITIONS[t.status].includes(b.status)) {
         throw AppError.conflict(`Cannot change trip from ${t.status} to ${b.status}`);
       }
-      // The bus does not move without a conductor.
+      // The bus does not move until it is confirmed, nor without a conductor.
+      if (['boarding', 'departed'].includes(b.status) && t.status !== b.status && !t.busConfirmed) {
+        throw AppError.unprocessable(CONFIRM_FIRST);
+      }
       if (['boarding', 'departed'].includes(b.status) && !t.conductorId && !t.standInConductorId) {
         throw AppError.unprocessable('Assign a conductor first (Bus & crew). The bus cannot leave without one.');
       }

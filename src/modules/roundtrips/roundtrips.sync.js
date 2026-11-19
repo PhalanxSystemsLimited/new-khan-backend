@@ -20,6 +20,7 @@ import { query, one } from '../../config/db.js';
 import { AppError } from '../../utils/AppError.js';
 import { loadTrip, voucherStops } from '../tripvouchers/tripVouchers.service.js';
 import { copyOffrouteDefaults, issueToken } from './roundtrips.service.js';
+import { confirmedSql } from '../trips/busConfirm.js';
 
 const TZ = 'Asia/Karachi';
 const pkDate = (d) => new Date(d).toLocaleDateString('en-CA', { timeZone: TZ });
@@ -353,14 +354,16 @@ const RAN = ['departed', 'arrived'];
  */
 export async function chainEndingWith(client, lastTripId) {
   // Compared inside the database: a JavaScript date would round the departure time to milliseconds.
-  // Rows come newest first; lag() is the next (later) leg of each row.
+  // Rows come newest first; lag() is the next (later) leg of each row. A trip whose bus was only planned
+  // (busConfirm.js) never ran on this bus, so it is skipped like a cancelled one.
+  const confirmed = await confirmedSql('t', client);
   const { rows } = await query(
     `SELECT t.id, t.status::text AS status, ot.is_origin AS starts_at_origin, dt.city_id AS to_city_id,
             EXISTS (SELECT 1 FROM round_trip_legs l WHERE l.trip_id = t.id) AS in_report,
             lag(ot.city_id) OVER w AS next_from_city_id,
             EXTRACT(EPOCH FROM (lag(t.departure_at) OVER w - COALESCE(t.arrival_at, t.departure_at))) / 3600 AS gap_hours
      FROM trips last
-     JOIN trips t ON t.bus_id = last.bus_id AND t.departure_at <= last.departure_at AND t.status <> 'cancelled'
+     JOIN trips t ON t.bus_id = last.bus_id AND t.departure_at <= last.departure_at AND t.status <> 'cancelled' AND ${confirmed}
      JOIN routes r ON r.id = t.route_id
      JOIN terminals ot ON ot.id = r.origin_terminal_id
      JOIN terminals dt ON dt.id = r.destination_terminal_id
@@ -416,10 +419,11 @@ export async function autoCreateReport(client, { tripId, userId = null, requireO
 
 /** Safety net: the bus is leaving an origin again, so its previous trip (if not in a report) closes a round trip. */
 export async function closePreviousRoundTrip(client, { tripId, userId = null }) {
+  const confirmed = await confirmedSql('p', client);
   const prev = await one(
     `SELECT p.id FROM trips t
      JOIN routes r ON r.id = t.route_id JOIN terminals ot ON ot.id = r.origin_terminal_id
-     JOIN trips p ON p.bus_id = t.bus_id AND p.departure_at < t.departure_at AND p.status <> 'cancelled'
+     JOIN trips p ON p.bus_id = t.bus_id AND p.departure_at < t.departure_at AND p.status <> 'cancelled' AND ${confirmed}
      WHERE t.id = $1 AND ot.is_origin
        AND NOT EXISTS (SELECT 1 FROM round_trip_legs l WHERE l.trip_id = p.id)
      ORDER BY p.departure_at DESC LIMIT 1`,

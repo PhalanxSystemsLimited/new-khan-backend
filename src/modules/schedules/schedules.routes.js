@@ -7,6 +7,7 @@ import { AppError } from '../../utils/AppError.js';
 import { buildUpdate } from '../../utils/sql.js';
 import { audit } from '../../utils/audit.js';
 import { busClass, idParam, intId, isoDate, time } from '../../utils/schemas.js';
+import { busConfirmReady } from '../trips/busConfirm.js';
 
 const router = Router();
 const admin = [requireAuth, requireRole(...ADMIN_ROLES)];
@@ -107,7 +108,10 @@ router.post(
     const result = await withTransaction((client) => generateTrips(client, id, fromDate, toDate, bookingCloseMinutes));
     await audit({
       req, action: 'schedule.generate_trips', entityType: 'schedule', entityId: id,
-      newData: { fromDate, toDate, created: result.created, alreadyThere: result.alreadyThere, skippedBusBusy: result.skipped.map((s) => s.date) },
+      newData: {
+        fromDate, toDate, created: result.created, alreadyThere: result.alreadyThere, busToConfirm: result.busToConfirm,
+        skippedBusBusy: result.skipped.map((s) => s.date),
+      },
     });
     res.status(201).json({ data: result });
   },
@@ -116,11 +120,15 @@ router.post(
 /**
  * The work behind "Create trips". Each running day in the range is one of:
  *  - already there (this schedule already has that trip): left alone;
- *  - bus busy (the default bus is on another trip that overlaps): skipped and reported, so staff can
- *    add that day with another bus;
  *  - created.
+ * Tickets are sold on the departure, not the bus (busConfirm.js): every trip is created with the default bus as its
+ * PLANNED bus (seat type and class only) and the bus is confirmed at departure time, so no day is skipped.
+ *
+ * Before migration 2026-11-22 (no bus_confirmed column) it works as it used to: a day when the default bus is busy
+ * (on another trip that overlaps) is skipped and reported, so staff can add that day with another bus.
  */
 export async function generateTrips(client, id, fromDate, toDate, bookingCloseMinutes) {
+  const planned = await busConfirmReady(client);
   const sched = await one(
     `SELECT s.id, s.default_bus_id, s.is_active, r.est_duration_minutes
      FROM schedules s JOIN routes r ON r.id = s.route_id WHERE s.id = $1`,
@@ -171,6 +179,7 @@ export async function generateTrips(client, id, fromDate, toDate, bookingCloseMi
   let lastArr = null; // a route longer than a day would make this run's own trips overlap
   for (const d of days) {
     if (d.alreadyThere) { alreadyThere += 1; continue; }
+    if (planned) { toCreate.push(d.dep); continue; } // the bus is confirmed later: nothing to skip
     if (d.clashTripId) {
       skipped.push({ date: d.day, departureAt: d.dep, clashTripId: d.clashTripId, clashRoute: d.clashRoute, clashDepartureAt: d.clashDepartureAt });
       continue;
@@ -186,10 +195,10 @@ export async function generateTrips(client, id, fromDate, toDate, bookingCloseMi
   let trips = [];
   if (toCreate.length) {
     ({ rows: trips } = await query(
-      `INSERT INTO trips (schedule_id, route_id, bus_id, departure_at, arrival_at, booking_closes_at)
+      `INSERT INTO trips (schedule_id, route_id, bus_id, departure_at, arrival_at, booking_closes_at${planned ? ', bus_confirmed' : ''})
        SELECT s.id, s.route_id, s.default_bus_id, d.dep,
               d.dep + make_interval(mins => r.est_duration_minutes),
-              d.dep - make_interval(mins => $3)
+              d.dep - make_interval(mins => $3)${planned ? ', FALSE' : ''}
        FROM schedules s JOIN routes r ON r.id = s.route_id
        CROSS JOIN unnest($2::timestamptz[]) AS d(dep)
        WHERE s.id = $1
@@ -199,7 +208,7 @@ export async function generateTrips(client, id, fromDate, toDate, bookingCloseMi
       client,
     ));
   }
-  return { created: trips.length, trips, alreadyThere, bus: bus.registrationNo, skipped };
+  return { created: trips.length, trips, alreadyThere, bus: bus.registrationNo, skipped, busToConfirm: planned };
 }
 
 export default router;

@@ -18,6 +18,7 @@ import { isEmployee } from '../../middleware/auth.js';
 import { cnicMasked } from '../../utils/cnic.js';
 import { qrSvg } from '../roundtrips/roundtrips.service.js';
 import { seatOrder } from '../../utils/seats.js';
+import { confirmedSql } from '../trips/busConfirm.js';
 
 let ready = false;
 let checkedAt = 0;
@@ -76,9 +77,10 @@ export function ticketState(bookingStatus, tripStatus) {
 /** The check page's data for a scanned code, or null when no ticket has that code. */
 export async function checkTicket(token, user, client) {
   if (!(await ticketQrReady(client))) return null;
+  const confirmed = await confirmedSql('t', client);
   const b = await one(
     `SELECT bk.id, bk.pnr, bk.status, bk.channel, bk.contact_name, bk.contact_phone, bk.holder_cnic,
-            bk.total_amount, bk.confirmed_at, bk.cancelled_at,
+            bk.total_amount, bk.confirmed_at, bk.cancelled_at, ${confirmed} AS bus_confirmed,
             r.name AS route_name, t.id AS trip_id, t.status AS trip_status, b.bus_class,
             b.registration_no, b.fleet_no,
             bt.name AS boarding_terminal, dt.name AS dropping_terminal,
@@ -127,7 +129,7 @@ export async function checkTicket(token, user, client) {
     staff: true,
     bookingId: b.id,
     tripId: b.tripId,
-    bus: b.fleetNo ? `${b.fleetNo} · ${b.registrationNo}` : b.registrationNo,
+    bus: `${b.fleetNo ? `${b.fleetNo} · ${b.registrationNo}` : b.registrationNo}${b.busConfirmed ? '' : ' (planned, to confirm)'}`,
     bookingStatus: b.status,
     tripStatus: b.tripStatus,
     channel: b.channel,

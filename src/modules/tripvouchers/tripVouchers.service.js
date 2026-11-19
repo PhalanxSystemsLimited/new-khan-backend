@@ -16,6 +16,7 @@ import { AppError } from '../../utils/AppError.js';
 import { qrSvg } from '../roundtrips/roundtrips.service.js';
 import { cargoListsReady, closeListForVoucher, moveListToVoucher, openListTotals } from '../cargo/cargo.lists.js';
 import { seatOrder } from '../../utils/seats.js';
+import { confirmedSql, CONFIRM_FIRST } from '../trips/busConfirm.js';
 
 /** Paid seats: a ticket is only confirmed once its booking is paid; boarded and no-show were paid too. */
 export const PAID = `('confirmed', 'boarded', 'no_show')`;
@@ -32,9 +33,10 @@ async function runAll(client, fns) {
 }
 
 export async function loadTrip(id, client) {
+  const confirmed = await confirmedSql('t', client);
   const trip = await one(
     `SELECT t.id, t.status, t.departure_at, t.arrival_at, t.hostess_name, t.route_id, t.bus_id,
-            t.conductor_id, t.stand_in_conductor_id,
+            t.conductor_id, t.stand_in_conductor_id, ${confirmed} AS bus_confirmed,
             r.code AS route_code, r.name AS route_name,
             b.registration_no, b.fleet_no, b.bus_class, b.layout_id, l.total_seats,
             d.full_name AS driver_name, cn.full_name AS conductor_name, cn.user_id AS conductor_user_id,
@@ -200,6 +202,7 @@ export async function generateVoucher(client, { tripId, boardingStopId, loadAmou
   if (!canGenerateAt(user, stop)) {
     throw AppError.forbidden(user.terminalId ? 'You can only generate vouchers at your own terminal.' : 'Your account has no terminal. Ask an admin to set one.');
   }
+  if (!trip.busConfirmed) throw AppError.unprocessable(CONFIRM_FIRST);
   if (!trip.conductorId && !trip.standInConductorId) {
     throw AppError.unprocessable('Assign a conductor to this trip first. The bus cannot leave without one.');
   }

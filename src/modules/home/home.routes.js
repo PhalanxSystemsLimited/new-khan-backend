@@ -14,10 +14,13 @@ import { AppError } from '../../utils/AppError.js';
 import { intId, isoDate } from '../../utils/schemas.js';
 import { cargoForDepartures, cargoListsReady } from '../cargo/cargo.lists.js';
 import { arrivalCounts } from '../cargo/cargo.arrival.js';
+import { confirmedSql } from '../trips/busConfirm.js';
 
 const TZ = 'Asia/Karachi';
 const today = () => new Date().toLocaleDateString('en-CA', { timeZone: TZ });
 const ACTIVE = `('held', 'reserved', 'confirmed', 'boarded')`;
+/** Counter sales stop this long after the bus was due (bookings.service treats it as gone then too). */
+const SELL_GRACE_MS = 12 * 60 * 60_000;
 
 export const homeRouter = Router();
 
@@ -37,9 +40,11 @@ homeRouter.get(
     const terminal = await one(`SELECT t.id, t.name, c.name AS city FROM terminals t JOIN cities c ON c.id = t.city_id WHERE t.id = $1`, [terminalId]);
     if (!terminal) throw AppError.notFound('Terminal not found');
 
+    const confirmed = await confirmedSql('t');
     const { rows } = await query(
       `SELECT t.id AS trip_id, t.status::text AS status, t.delay_minutes, t.route_id, r.name AS route_name,
-              b.registration_no AS bus_no, b.fleet_no, b.bus_class::text AS bus_class,
+              b.registration_no AS bus_no, b.fleet_no, b.bus_class::text AS bus_class, ${confirmed} AS bus_confirmed,
+              r.origin_terminal_id = $1 AS starts_here,
               rs.id AS stop_id, rs.stop_order, rs.is_boarding_point,
               r.destination_terminal_id = $1 AS ends_here,
               t.departure_at + make_interval(mins => rs.minutes_from_origin + t.delay_minutes) AS here_at,
@@ -62,9 +67,13 @@ homeRouter.get(
           WHERE tv.trip_id = t.id AND tv.status = 'generated' ORDER BY tv.generated_at DESC LIMIT 1
        ) lv ON TRUE
        WHERE t.status <> 'cancelled'
-         AND ((t.departure_at + make_interval(mins => rs.minutes_from_origin + t.delay_minutes)) AT TIME ZONE '${TZ}')::date = $2::date
+         AND (((t.departure_at + make_interval(mins => rs.minutes_from_origin + t.delay_minutes)) AT TIME ZONE '${TZ}')::date = $2::date
+              -- Today: also last night's bus that is late and still here (no voucher yet), so it never drops off at midnight.
+              OR ($3 AND v.id IS NULL AND t.status <> 'arrived' AND rs.is_boarding_point AND r.destination_terminal_id <> $1
+                  AND ((t.departure_at + make_interval(mins => rs.minutes_from_origin + t.delay_minutes)) AT TIME ZONE '${TZ}')::date = $2::date - 1
+                  AND t.departure_at + make_interval(mins => rs.minutes_from_origin + t.delay_minutes) > now() - interval '12 hours'))
        ORDER BY here_at`,
-      [terminalId, date],
+      [terminalId, date, date === today()],
     );
 
     // Destinations and fares from this terminal, for each trip that boards here.
@@ -84,8 +93,24 @@ homeRouter.get(
       ),
     ]);
 
+    const now = Date.now();
     const departures = rows.map((r) => {
       const later = stops.rows.filter((s) => s.routeId === r.routeId && s.stopOrder > r.stopOrder && s.isDroppingPoint);
+      const due = new Date(r.hereAt).getTime();
+      // Where the counter shows it: buses leaving from here (a boarding point, not the last stop) are "upcoming"
+      // until their time, then "late" until the voucher is made here (a bus still at the terminal never drops off
+      // the list), then "left". Buses ending here are "arriving" (with the Arrived button); buses only passing
+      // through to drop passengers are "passing" (not shown).
+      const leavesHere = r.isBoardingPoint && !r.endsHere;
+      const section = r.endsHere
+        ? 'arriving'
+        : !leavesHere
+          ? 'passing'
+          : due > now
+            ? 'upcoming'
+            : r.voucherId || r.status === 'arrived'
+              ? 'left'
+              : 'late';
       const destinations = later
         .map((s) => ({
           stopId: s.id,
@@ -104,12 +129,17 @@ homeRouter.get(
         stopId: r.stopId,
         hereAt: r.hereAt,
         endsHere: r.endsHere,
+        startsHere: r.startsHere,
+        section,
+        busConfirmed: r.busConfirmed,
         boardsHere: boards,
         seatsLeft: Math.max(0, r.seats - r.taken),
         seats: r.seats,
         voucher: r.voucherId ? { id: r.voucherId, voucherNo: r.voucherNo } : null,
-        // Counter sales close when this terminal's voucher is generated.
-        canSell: boards && !r.voucherId && r.bookingOpen && ['scheduled', 'delayed', 'boarding', 'departed'].includes(r.status),
+        // Counter sales close when this terminal's voucher is generated, or 12 hours after the bus was due here
+        // (a forgotten departure; the same rule the booking itself checks).
+        canSell: boards && !r.voucherId && r.bookingOpen && ['scheduled', 'delayed', 'boarding', 'departed'].includes(r.status)
+          && due > now - SELL_GRACE_MS,
         lastLeft: r.lastLeft,
         lastLeftAt: r.lastLeftAt,
         driverName: r.driverName,
@@ -129,7 +159,7 @@ homeRouter.get(
       for (const d of departures) d.cargo = d.takesCargo ? cargo.byTrip[d.tripId] ?? { listId: null, parcelCount: 0, status: null } : null;
     }
     res.set('Cache-Control', 'no-store');
-    res.json({ data: { date, terminal: { id: terminal.id, name: terminal.name, city: terminal.city }, departures, cargoWaiting: cargo ? cargo.waiting : null, cargoArrivals } });
+    res.json({ data: { date, today: today(), now: new Date(now).toISOString(), terminal: { id: terminal.id, name: terminal.name, city: terminal.city }, departures, cargoWaiting: cargo ? cargo.waiting : null, cargoArrivals } });
   },
 );
 
@@ -182,6 +212,7 @@ homeRouter.get(
   validate({ query: z.object({ date: isoDate.optional() }).strict() }),
   async (req, res) => {
     const date = req.valid.query.date ?? today();
+    const confirmed = await confirmedSql('t');
     const { rows: trips } = await query(
       `SELECT t.id, t.departure_at, t.delay_minutes, t.status::text AS status, r.name AS route_name,
               oc.name AS from_city, b.registration_no AS bus_no,
@@ -189,6 +220,7 @@ homeRouter.get(
               COALESCE(cn.full_name, si.full_name) AS conductor_name,
               (SELECT count(*) FROM tickets tk WHERE tk.trip_id = t.id AND tk.status IN ${ACTIVE})::int AS seats_taken,
               (SELECT count(*) FROM layout_seats ls WHERE ls.layout_id = b.layout_id AND ls.is_bookable)::int AS seats,
+              ${confirmed} AS bus_confirmed,
               (SELECT count(*) FROM route_stops rs WHERE rs.route_id = r.id AND rs.is_boarding_point
                  AND rs.stop_order < (SELECT max(stop_order) FROM route_stops x WHERE x.route_id = r.id))::int AS voucher_stops,
               (SELECT count(*) FROM trip_vouchers tv WHERE tv.trip_id = t.id AND tv.status = 'generated')::int AS vouchers,
@@ -227,6 +259,7 @@ homeRouter.get(
           delayed: live.filter((t) => t.status === 'delayed' || t.delayMinutes > 0).length,
           cancelled: trips.length - live.length,
           missingCrew: live.filter((t) => !t.driverName || !t.conductorName).length,
+          busToConfirm: live.filter((t) => t.busConfirmed === false && ['scheduled', 'delayed', 'boarding'].includes(t.status)).length,
           seatsSold: live.reduce((s, t) => s + t.seatsTaken, 0),
         },
         trips,

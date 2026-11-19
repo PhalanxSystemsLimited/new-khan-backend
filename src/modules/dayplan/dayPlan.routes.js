@@ -13,6 +13,7 @@ import { requireAuth, requireRole, MANAGER_ROLES } from '../../middleware/auth.j
 import { AppError } from '../../utils/AppError.js';
 import { audit } from '../../utils/audit.js';
 import { isoDate } from '../../utils/schemas.js';
+import { confirmedSql } from '../trips/busConfirm.js';
 
 const TZ = 'Asia/Karachi';
 const DAY = 86_400_000;
@@ -42,8 +43,9 @@ const tracked = (t) =>
   Object.fromEntries(Object.keys(TRACKED).map((k) => [k, t[k] instanceof Date ? t[k].toISOString() : t[k] ?? null]));
 
 async function loadTrips(from, to, client) {
+  const confirmed = await confirmedSql('t', client);
   const { rows } = await query(
-    `SELECT t.id, t.departure_at, t.delay_minutes, t.status::text AS status, t.hostess_name, t.route_id,
+    `SELECT t.id, t.departure_at, t.delay_minutes, t.status::text AS status, t.hostess_name, t.route_id, ${confirmed} AS bus_confirmed,
             r.name AS route_name, r.code AS route_code,
             ot.id AS terminal_id, oc.name AS terminal_city, ot.name AS terminal_name,
             b.registration_no AS bus_no, b.fleet_no, b.has_hostess, l.total_seats,
@@ -83,7 +85,10 @@ async function loadTrips(from, to, client) {
       terminalId: t.terminalId,
       terminal: `${t.terminalCity}`,
       terminalName: t.terminalName,
-      busNo: t.busNo,
+      // A planned bus (busConfirm.js) is marked, so nobody reads it as the bus that goes; confirming it later
+      // shows up as a change since publishing.
+      busNo: t.busConfirmed ? t.busNo : `${t.busNo} (to confirm)`,
+      busConfirmed: t.busConfirmed,
       fleetNo: t.fleetNo,
       totalSeats: t.totalSeats,
       seatsSold: t.seatsSold,

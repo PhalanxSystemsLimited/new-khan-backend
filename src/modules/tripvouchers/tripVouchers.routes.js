@@ -214,6 +214,7 @@ router.get('/:id', validate({ params: bigIdParam }), async (req, res) => {
         conductorName: trip.conductorName,
         standInConductorName: trip.standInConductorName,
         hasConductor: Boolean(trip.conductorId || trip.standInConductorId),
+        busConfirmed: trip.busConfirmed,
       },
       terminals,
       wholeTrip: {

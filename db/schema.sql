@@ -278,6 +278,9 @@ CREATE TABLE trips (
     delay_minutes       INT NOT NULL DEFAULT 0,
     booking_open        BOOLEAN NOT NULL DEFAULT TRUE,
     booking_closes_at   TIMESTAMPTZ,                   -- e.g. 30 min before departure
+    -- FALSE: the bus is only planned (sets the seat type tickets are sold on); confirmed at departure in Bus & crew
+    -- (migration 2026-11-22-bus-confirm.sql). Unconfirmed trips never block a bus and cannot get a voucher or leave.
+    bus_confirmed       BOOLEAN NOT NULL DEFAULT TRUE,
     cancel_reason       TEXT,
     created_at          TIMESTAMPTZ NOT NULL DEFAULT now(),
     updated_at          TIMESTAMPTZ NOT NULL DEFAULT now(),

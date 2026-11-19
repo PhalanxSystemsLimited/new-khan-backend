@@ -16,7 +16,7 @@ import { Router } from 'express';
 import { z } from 'zod';
 import { query, one, withTransaction } from '../../config/db.js';
 import { validate } from '../../middleware/validate.js';
-import { requireAuth, requireRole, ADMIN_ROLES, MANAGER_ROLES } from '../../middleware/auth.js';
+import { requireAuth, requireRole, ADMIN_ROLES, STAFF_ROLES } from '../../middleware/auth.js';
 import { AppError } from '../../utils/AppError.js';
 import { audit } from '../../utils/audit.js';
 import { cnic, intId, isoDate, longText, pagination, personName, phone, text, uuid } from '../../utils/schemas.js';
@@ -360,13 +360,13 @@ adminEmployeesRouter.patch(
 );
 
 // ---------------------------------------------------------------------------------------------------------------
-// Dropdowns (Bus & crew, round trip reports)
+// Dropdowns (Bus & crew, round trip reports). Counter staff too: they set the bus and crew at departure time.
 // ---------------------------------------------------------------------------------------------------------------
 export const crewRouter = Router();
 crewRouter.get(
   '/crew',
   requireAuth,
-  requireRole(...MANAGER_ROLES),
+  requireRole(...STAFF_ROLES),
   validate({ query: z.object({ kind: z.enum(['driver', 'conductor', 'hostess', 'cashier']) }).strict() }),
   async (req, res) => {
     const { rows } = await query(

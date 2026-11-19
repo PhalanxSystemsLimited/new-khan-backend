@@ -244,6 +244,15 @@ adding a bus (the old test "NK 2+2 AC 40-seater" is switched off). Seat lists ar
 A customer's **booking** is for one trip between two stops and has one **ticket** per seat/passenger. **Payments** and
 **refunds** hang off the booking. A return journey is **two bookings** (one per bus).
 
+**Tickets are sold on the departure, not the bus** (migration `2026-11-22-bus-confirm.sql`, `src/modules/trips/busConfirm.js`).
+Every trip keeps a bus, but `trips.bus_confirmed = FALSE` means it is only the **planned** bus: it sets the seat layout and
+class the tickets are sold on. "Create trips" and extra departures without a bus make planned trips. At departure time the
+counter (departures leaving their own terminal), a manager or an admin confirms the bus that goes in Bus & crew: the planned
+one or another free bus with the same seat layout, so passengers keep their seat numbers. A planned bus never blocks another
+trip (the "bus is busy" check counts confirmed trips only), and a trip cannot get a voucher, board or depart until its bus
+is confirmed. Round trip reports skip planned trips when walking back through a bus's trips. Trips that existed before the
+migration are confirmed; until it runs, every trip counts as confirmed and everything works as before.
+
 ### 6.2 Booking lifecycle
 
 ```
@@ -489,12 +498,15 @@ Access: **public**, **C** = any signed-in user, **owner** = the booking's custom
 | GET | `/fares?routeId=` | public | Fare table |
 | POST/PATCH | `/fares[/:id]` | A | Manage fares |
 | GET/POST/PATCH | `/schedules[/:id]` | S read · A write | Timetables |
-| POST | `/schedules/:id/generate-trips` | A | Create dated trips (≤ 92 days, safe to re-run). Days when the default bus is already on an overlapping trip are skipped and returned in `skipped` (with the clashing trip); `alreadyThere` counts days that had the trip |
+| POST | `/schedules/:id/generate-trips` | A | Create dated trips (≤ 92 days, safe to re-run; `alreadyThere` counts days that had the trip). Every trip is made with the default bus as its **planned** bus (`busToConfirm: true`), so no day is skipped. Before migration `2026-11-22-bus-confirm.sql`: days when the default bus is on an overlapping trip are skipped and returned in `skipped` |
 | GET | `/trips/search?fromCityId&toCityId&date&passengers&busClass` | public | Search trips |
 | GET | `/trips/:id` · `/trips/:id/seats` | public | Trip details, seat map (no passenger data) |
 | GET | `/trips?date=` · `/trips/:id/manifest` | S | Operations |
-| POST · PATCH | `/trips` · `/trips/:id/assignment` | A | Ad-hoc trips (optional `returnTrip: { routeId, departureAt, driverId? }` adds the same bus's return trip: both or neither; it must start where the bus arrives and leave after it arrives), bus/crew assignment |
-| PATCH | `/trips/:id/status` | S (cancel = A) | boarding / departed / arrived / delayed / cancelled |
+| POST | `/trips` | A | Ad-hoc trips (optional `returnTrip: { routeId, departureAt, driverId? }` adds the same bus's return trip: both or neither; it must start where the bus arrives and leave after it arrives) |
+| PATCH | `/trips/:id/assignment` | S | Bus & crew. Saving with a `busId` **confirms** the bus: same seat layout, active, not on another confirmed trip then (a different class is allowed, with a `warnings` line). Counter staff: departures leaving from their own terminal, before the bus leaves, no stand-in |
+| GET | `/trips/:id/bus-options` | S | Active buses with the trip's seat layout, each with `busyTripId` (the confirmed trip it is on then) |
+| GET · POST | `/trips/extra-options?terminalId=` · `/trips/extra` | S | Extra departure for a busy day `{ routeId, departureAt, layoutId + busClass \| busId, allowNear? }`: on sale at once; without a bus it is planned (bus to confirm). Counter staff: routes leaving their terminal. Another departure on the route within 30 min → 409 `NEAR_DEPARTURE` until sent with `allowNear` |
+| PATCH | `/trips/:id/status` | S (cancel = A) | boarding / departed / arrived / delayed / cancelled. Boarding and departed need a confirmed bus (and a conductor) |
 | GET | `/cargo/setup` · `/cargo/quote` | S | Cargo: terminals, rates, settings; the rate-table charge |
 | PUT · POST · PATCH | `/cargo/settings` · `/cargo/rates[/:id]` | A | Cargo rules / not-allowed text printed on the slip, overdue days, staff may change charge; rates per city pair (per kg, per piece, minimum) |
 | GET · POST | `/cargo/parcels` | S | Search parcels (CG number or scanned QR link, phone, CNIC, name) · book a parcel (counter staff: own terminal only; lower charge needs a reason) |
