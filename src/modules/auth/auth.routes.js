@@ -4,7 +4,7 @@ import { supabaseAdmin, supabasePublic } from '../../config/supabase.js';
 import { env } from '../../config/env.js';
 import { one } from '../../config/db.js';
 import { validate } from '../../middleware/validate.js';
-import { requireAuth } from '../../middleware/auth.js';
+import { forgetUserTokens, requireAuth } from '../../middleware/auth.js';
 import { authLimiter, otpLimiter } from '../../middleware/rateLimit.js';
 import { AppError } from '../../utils/AppError.js';
 import { cnic, email, password, personName, phone } from '../../utils/schemas.js';
@@ -142,6 +142,7 @@ router.post('/logout', requireAuth, async (req, res) => {
   // Revokes all refresh tokens for this session.
   const { error } = await supabaseAdmin.auth.admin.signOut(req.accessToken, 'global');
   if (error) req.log.warn({ code: error.code }, 'logout failed');
+  forgetUserTokens(req.user.id);
   res.json({ message: 'Logged out' });
 });
 
@@ -193,6 +194,7 @@ router.post(
     if (error) throw AppError.badRequest('Unable to update password');
     // Invalidate other sessions after a password change.
     await supabaseAdmin.auth.admin.signOut(req.accessToken, 'others').catch(() => {});
+    forgetUserTokens(req.user.id);
     res.json({ message: 'Password updated' });
   },
 );

@@ -189,6 +189,17 @@ replaced by a scheduled call. Two Vercel projects from the same repository:
 | Website + admin panel | `frontend` | `frontend/vercel.json` (all pages open the app) |
 | API | `backend` | `backend/vercel.json`, `backend/api/index.js` |
 
+**Region:** `vercel.json` runs the API in Singapore (`"regions": ["sin1"]`), next to the Supabase database
+(ap-southeast-1). Every request makes several database queries, so the API must sit near the database: from the
+default US region each query crossed the Pacific (about 0.2 s each). If the database ever moves, change `regions` to
+the Vercel region nearest to it.
+
+**Sign-in check:** each request's token is checked with Supabase Auth once, then remembered for up to a minute in that
+server's memory (`src/middleware/auth.js`), so clicks do not each wait for Supabase. The role and "account active"
+are still read from the database on every request (a deactivated account or a role change takes effect at once);
+signing out or changing the password forgets the remembered tokens; a sign-out on another device reaches other
+server copies within a minute.
+
 **API project, environment variables** (Settings → Environment Variables): everything from `.env`, with these
 differences:
 
