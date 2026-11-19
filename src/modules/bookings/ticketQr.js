@@ -17,6 +17,7 @@ import { env } from '../../config/env.js';
 import { isEmployee } from '../../middleware/auth.js';
 import { cnicMasked } from '../../utils/cnic.js';
 import { qrSvg } from '../roundtrips/roundtrips.service.js';
+import { seatOrder } from '../../utils/seats.js';
 
 let ready = false;
 let checkedAt = 0;
@@ -97,7 +98,7 @@ export async function checkTicket(token, user, client) {
   const { rows: tickets } = await query(
     `SELECT ls.seat_number, tk.passenger_name, tk.status, tk.boarded_at
      FROM tickets tk JOIN layout_seats ls ON ls.id = tk.seat_id
-     WHERE tk.booking_id = $1 ORDER BY ls.seat_number`,
+     WHERE tk.booking_id = $1 ORDER BY ${seatOrder('ls')}`,
     [b.id],
     client,
   );

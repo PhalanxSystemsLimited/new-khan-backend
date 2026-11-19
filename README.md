@@ -235,8 +235,12 @@ If pg_cron was enabled it can stay: running the release twice is harmless.
 ### 6.1 Data model in one paragraph
 
 **Cities** have **terminals**. A **route** is an ordered list of **route stops** (each a terminal, with minutes from origin).
-**Fares** are set per (route, boarding stop, dropping stop). A **seat layout** (e.g. 2+2, 40 seats) belongs
-to **buses**. **Schedules** (route + departure time + days) generate dated **trips** (`POST /schedules/:id/generate-trips`).
+**Fares** are set per (route, boarding stop, dropping stop). A **seat layout** belongs
+to **buses**. The fleet layouts are **NK 2+2 49-seater** and **NK 2+1 31-seater** (migration `2026-11-21-seat-layouts.sql`),
+made by `create_coach_layout(name, driver_side, door_side, rows, back_row)`: driver on the right (row 0, seat `D`, not
+bookable), the aisle as an empty column, seats numbered 1, 2, 3 ... from the driver side across each row, and a
+full-width back row (e.g. `('NK 2+2 45-seater', 2, 2, 10, 5)` for a 45-seater). `seat_layouts.is_active` = offered when
+adding a bus (the old test "NK 2+2 AC 40-seater" is switched off). Seat lists are sorted by number (`utils/seats.js`). **Schedules** (route + departure time + days) generate dated **trips** (`POST /schedules/:id/generate-trips`).
 A customer's **booking** is for one trip between two stops and has one **ticket** per seat/passenger. **Payments** and
 **refunds** hang off the booking. A return journey is **two bookings** (one per bus).
 
@@ -263,7 +267,8 @@ Rules:
 - A customer may have at most **3 unpaid (`pending`) bookings** at a time.
 - **No double booking**: a unique index on `(trip_id, seat_id)` for active tickets. Two people can never hold the same seat.
 - No seat is reserved for women. A male and a female passenger from **different bookings** may not sit side by side
-  (neighbouring seats on the same side of the aisle, e.g. 1A–1B; across the aisle is fine). A mixed pair in one booking is
+  (neighbouring seats on the same side of the aisle, e.g. 1–2 or 3–4; across the aisle is fine; on the full-width back row
+  every seat and the next, e.g. 45–46 ... 48–49). A mixed pair in one booking is
   allowed. Enforced by the `tickets_validate_seat_neighbours` trigger (error `SEAT_GENDER`, 409). Passengers are male or female only.
 - **CNIC.** Every new booking needs the booking holder's CNIC, one per booking (a family travels on one CNIC): online,
   counter sale and the conductor's roadside passenger. Error `CNIC_REQUIRED` (400) without one. Made-up numbers

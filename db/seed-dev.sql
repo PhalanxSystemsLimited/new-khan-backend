@@ -33,8 +33,9 @@ JOIN cities c ON c.name = v.city
 ON CONFLICT (code) DO NOTHING;
 
 -- ---- Seat layout: 2+2 AC coach, 10 rows x 4 (A B | C D) ----
-INSERT INTO seat_layouts (name, total_seats, row_count, col_count)
-VALUES ('NK 2+2 AC 40-seater', 40, 10, 4)
+-- Test layout only: not offered for new buses (the fleet uses NK 2+2 49-seater and NK 2+1 31-seater).
+INSERT INTO seat_layouts (name, total_seats, row_count, col_count, is_active)
+VALUES ('NK 2+2 AC 40-seater', 40, 10, 4, FALSE)
 ON CONFLICT (name) DO NOTHING;
 
 INSERT INTO layout_seats (layout_id, seat_number, row_no, col_no, kind)

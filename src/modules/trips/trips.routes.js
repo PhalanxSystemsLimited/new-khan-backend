@@ -12,6 +12,7 @@ import { searchLimiter } from '../../middleware/rateLimit.js';
 import { AppError } from '../../utils/AppError.js';
 import { audit } from '../../utils/audit.js';
 import { bigIdParam, busClass, intId, isoDate, isoDateTime, longText, personName } from '../../utils/schemas.js';
+import { seatOrder } from '../../utils/seats.js';
 
 const router = Router();
 const admin = [requireAuth, requireRole(...ADMIN_ROLES)];
@@ -425,7 +426,7 @@ router.get('/:id/manifest', ...staff, validate({ params: bigIdParam }), async (r
      JOIN route_stops bs  ON bs.id = bk.boarding_stop_id JOIN terminals bt ON bt.id = bs.terminal_id
      JOIN route_stops ds  ON ds.id = bk.dropping_stop_id JOIN terminals dt ON dt.id = ds.terminal_id
      WHERE tk.trip_id = $1 AND tk.status IN ('confirmed', 'boarded', 'no_show')
-     ORDER BY ls.row_no, ls.col_no`,
+     ORDER BY ${seatOrder('ls')}`,
     [req.valid.params.id],
   );
   res.json({ data: rows });

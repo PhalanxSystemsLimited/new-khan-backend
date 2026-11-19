@@ -6,6 +6,7 @@ import { isStaff, MANAGER_ROLES } from '../../middleware/auth.js';
 import { cnicDigits, cnicDisplay, cnicMasked } from '../../utils/cnic.js';
 import { sendSms, smsEnabled } from '../../utils/sms.js';
 import { findFare } from '../fares/fares.service.js';
+import { seatOrder } from '../../utils/seats.js';
 
 const MAX_PENDING_PER_USER = 3;
 const round2 = (n) => Math.round(n * 100) / 100;
@@ -37,7 +38,7 @@ export async function getBookingDetail(id, client) {
     `SELECT tk.id, tk.ticket_no, ls.seat_number, tk.passenger_name, tk.passenger_gender, tk.passenger_age,
             tk.fare_amount, tk.status
      FROM tickets tk JOIN layout_seats ls ON ls.id = tk.seat_id
-     WHERE tk.booking_id = $1 ORDER BY ls.seat_number`,
+     WHERE tk.booking_id = $1 ORDER BY ${seatOrder('ls')}`,
     [id],
     client,
   );

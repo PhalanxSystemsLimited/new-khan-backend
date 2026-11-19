@@ -96,7 +96,7 @@ async function tripView(tripId, user) {
       const t = tickets.rows.find((x) => x.seatId === s.id && x.status !== 'no_show');
       const noShow = tickets.rows.find((x) => x.seatId === s.id && x.status === 'no_show');
       return {
-        seatId: s.id, seatNumber: s.seatNumber, rowNo: s.rowNo, colNo: s.colNo, deck: s.deck, bookable: s.isBookable && s.kind !== 'driver' && s.kind !== 'blocked',
+        seatId: s.id, seatNumber: s.seatNumber, rowNo: s.rowNo, colNo: s.colNo, deck: s.deck, kind: s.kind, bookable: s.isBookable && s.kind !== 'driver' && s.kind !== 'blocked',
         passenger: t ? passengerOf(t) : null,
         noShow: noShow ? passengerOf(noShow) : null,
       };

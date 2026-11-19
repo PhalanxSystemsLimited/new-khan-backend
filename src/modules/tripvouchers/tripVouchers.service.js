@@ -15,6 +15,7 @@ import { env } from '../../config/env.js';
 import { AppError } from '../../utils/AppError.js';
 import { qrSvg } from '../roundtrips/roundtrips.service.js';
 import { cargoListsReady, closeListForVoucher, moveListToVoucher, openListTotals } from '../cargo/cargo.lists.js';
+import { seatOrder } from '../../utils/seats.js';
 
 /** Paid seats: a ticket is only confirmed once its booking is paid; boarded and no-show were paid too. */
 export const PAID = `('confirmed', 'boarded', 'no_show')`;
@@ -76,7 +77,7 @@ export async function paidPassengers(tripId, client) {
      JOIN bookings bk ON bk.id = tk.booking_id
      JOIN layout_seats ls ON ls.id = tk.seat_id
      WHERE tk.trip_id = $1 AND tk.status IN ${PAID}
-     ORDER BY ls.row_no, ls.col_no`,
+     ORDER BY ${seatOrder('ls')}`,
     [tripId],
     client,
   );

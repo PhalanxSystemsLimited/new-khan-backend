@@ -16,6 +16,7 @@ import {
 } from './bookings.service.js';
 import { reconcileSafepayBooking } from '../payments/payments.routes.js';
 import { checkTicket, ticketQrFor } from './ticketQr.js';
+import { seatOrder } from '../../utils/seats.js';
 
 const router = Router();
 
@@ -33,7 +34,7 @@ const LIST_SELECT = `
          bt.name AS boarding_terminal, dt.name AS dropping_terminal,
          t.departure_at + make_interval(mins => bs.minutes_from_origin) AS boarding_at,
          (SELECT count(*) FROM tickets tk WHERE tk.booking_id = bk.id)::int AS seats,
-         (SELECT array_agg(ls.seat_number ORDER BY ls.seat_number) FROM tickets tk JOIN layout_seats ls ON ls.id = tk.seat_id
+         (SELECT array_agg(ls.seat_number ORDER BY ${seatOrder('ls')}) FROM tickets tk JOIN layout_seats ls ON ls.id = tk.seat_id
            WHERE tk.booking_id = bk.id) AS seat_numbers
   FROM bookings bk
   JOIN trips t ON t.id = bk.trip_id JOIN routes r ON r.id = t.route_id
@@ -128,7 +129,7 @@ router.get(
       `SELECT bk.pnr, bk.status, bk.total_amount, bk.currency, bk.created_at, r.name AS route_name,
               bt.name AS boarding_terminal, dt.name AS dropping_terminal,
               t.departure_at + make_interval(mins => bs.minutes_from_origin) AS boarding_at,
-              (SELECT array_agg(ls.seat_number ORDER BY ls.seat_number) FROM tickets tk JOIN layout_seats ls ON ls.id = tk.seat_id
+              (SELECT array_agg(ls.seat_number ORDER BY ${seatOrder('ls')}) FROM tickets tk JOIN layout_seats ls ON ls.id = tk.seat_id
                 WHERE tk.booking_id = bk.id) AS seat_numbers
        FROM bookings bk
        JOIN trips t ON t.id = bk.trip_id JOIN routes r ON r.id = t.route_id

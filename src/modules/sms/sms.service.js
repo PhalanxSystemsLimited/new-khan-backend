@@ -9,6 +9,7 @@ import { one, query, withTransaction } from '../../config/db.js';
 import { AppError } from '../../utils/AppError.js';
 import { logger } from '../../utils/logger.js';
 import { sendSms, smsEnabled } from '../../utils/sms.js';
+import { seatOrder } from '../../utils/seats.js';
 
 const CODE_TTL_MINUTES = 10;
 const CODE_MAX_ATTEMPTS = 5;
@@ -79,7 +80,7 @@ export async function sendBookingConfirmationSms(bookingId) {
       `SELECT bk.id, bk.pnr, bk.contact_phone, bk.channel::text AS channel, bk.status,
               t.departure_at + make_interval(mins => bs.minutes_from_origin) AS departure_at, -- at the boarding stop
               cf.name AS from_city, ct.name AS to_city,
-              (SELECT string_agg(ls.seat_number, ', ' ORDER BY ls.seat_number) FROM tickets tk
+              (SELECT string_agg(ls.seat_number, ', ' ORDER BY ${seatOrder('ls')}) FROM tickets tk
                  JOIN layout_seats ls ON ls.id = tk.seat_id WHERE tk.booking_id = bk.id AND tk.status = 'confirmed') AS seats,
               EXISTS (SELECT 1 FROM sms_messages m WHERE m.booking_id = bk.id AND m.kind = 'booking_confirmed' AND m.status = 'sent') AS sent_before
        FROM bookings bk JOIN trips t ON t.id = bk.trip_id
