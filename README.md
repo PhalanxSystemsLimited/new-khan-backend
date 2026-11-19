@@ -501,7 +501,7 @@ Access: **public**, **C** = any signed-in user, **owner** = the booking's custom
 | POST | `/schedules/:id/generate-trips` | A | Create dated trips (≤ 92 days, safe to re-run; `alreadyThere` counts days that had the trip). Every trip is made with the default bus as its **planned** bus (`busToConfirm: true`), so no day is skipped. Before migration `2026-11-22-bus-confirm.sql`: days when the default bus is on an overlapping trip are skipped and returned in `skipped` |
 | GET | `/trips/search?fromCityId&toCityId&date&passengers&busClass` | public | Search trips |
 | GET | `/trips/:id` · `/trips/:id/seats` | public | Trip details, seat map (no passenger data) |
-| GET | `/trips?date=` · `/trips/:id/manifest` | S | Operations |
+| GET | `/trips?date=` · `/trips/:id/manifest` | S | Operations. Counter staff get only trips boarding at their terminal (a boarding stop, not the last), by the day the bus is due there, with `hereAt` / `hereCity` |
 | POST | `/trips` | A | Ad-hoc trips (optional `returnTrip: { routeId, departureAt, driverId? }` adds the same bus's return trip: both or neither; it must start where the bus arrives and leave after it arrives) |
 | PATCH | `/trips/:id/assignment` | S | Bus & crew. Saving with a `busId` **confirms** the bus: same seat layout, active, not on another confirmed trip then (a different class is allowed, with a `warnings` line). Counter staff: departures leaving from their own terminal, before the bus leaves, no stand-in |
 | GET | `/trips/:id/bus-options` | S | Active buses with the trip's seat layout, each with `busyTripId` (the confirmed trip it is on then) |

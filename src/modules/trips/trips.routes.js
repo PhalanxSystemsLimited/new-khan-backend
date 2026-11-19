@@ -279,9 +279,16 @@ router.get(
   }),
   async (req, res) => {
     const q = req.valid.query;
+    // Counter staff see only the buses that pick up passengers at their terminal (a boarding point, not the last
+    // stop: the voucher terminals), on the day the bus is there, with the time it is there (delay included).
+    // Buses ending at their terminal are on the Counter screen ("Arriving here").
+    const counter = !MANAGER_ROLES.includes(req.user.role);
+    if (counter && !req.user.terminalId) throw AppError.badRequest('Your account has no terminal. Ask an admin to set one.');
+    const mine = counter ? req.user.terminalId : null;
     const confirmed = await confirmedSql('t');
     const { rows } = await query(
       `SELECT t.*, ${confirmed} AS bus_confirmed, r.name AS route_name, r.origin_terminal_id,
+              my.here_at, my.here_city, -- counter staff: when the bus is at their terminal (delay included)
               b.registration_no, b.fleet_no, b.layout_id, b.bus_class, d.full_name AS driver_name,
               cn.full_name AS conductor_name, si.full_name AS stand_in_conductor_name,
               (SELECT count(*) FROM tickets tk WHERE tk.trip_id = t.id AND tk.status IN ${ACTIVE_TICKET})::int AS seats_taken,
@@ -298,11 +305,21 @@ router.get(
           SELECT tv.terminal_name, tv.generated_at FROM trip_vouchers tv
           WHERE tv.trip_id = t.id AND tv.status = 'generated' ORDER BY tv.generated_at DESC LIMIT 1
        ) lv ON TRUE
-       WHERE (t.departure_at AT TIME ZONE 'Asia/Karachi')::date = $1::date
+       LEFT JOIN LATERAL (
+          SELECT rs.id AS stop_id, c.name AS here_city,
+                 t.departure_at + make_interval(mins => rs.minutes_from_origin + t.delay_minutes) AS here_at,
+                 t.departure_at + make_interval(mins => rs.minutes_from_origin) AS here_scheduled
+          FROM route_stops rs JOIN terminals tm ON tm.id = rs.terminal_id JOIN cities c ON c.id = tm.city_id
+          WHERE rs.route_id = t.route_id AND rs.terminal_id = $4 AND rs.is_boarding_point
+            AND rs.stop_order < (SELECT max(x.stop_order) FROM route_stops x WHERE x.route_id = t.route_id)
+       ) my ON TRUE
+       WHERE ($4::int IS NULL OR my.stop_id IS NOT NULL)
+         -- The day by the timetable (a delay past midnight does not move a bus to the next day's list).
+         AND ((CASE WHEN $4::int IS NULL THEN t.departure_at ELSE my.here_scheduled END) AT TIME ZONE 'Asia/Karachi')::date = $1::date
          AND ($2::int IS NULL OR t.route_id = $2)
          AND ($3::trip_status IS NULL OR t.status = $3)
-       ORDER BY t.departure_at`,
-      [q.date, q.routeId ?? null, q.status ?? null],
+       ORDER BY COALESCE(my.here_at, t.departure_at), t.departure_at`,
+      [q.date, q.routeId ?? null, q.status ?? null, mine],
     );
     res.json({ data: rows });
   },
