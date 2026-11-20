@@ -193,25 +193,43 @@ router.get(
         pnr: z.string().trim().toUpperCase().regex(/^[A-Z0-9]{3,10}$/).optional(),
         phone: phone.optional(),
         status: z.enum(['pending', 'confirmed', 'cancelled', 'completed', 'expired', 'refunded']).optional(),
+        terminalId: intId.optional(), // managers and admins: only bookings boarding there
       })
       .strict(),
   }),
   async (req, res) => {
     const q = req.valid.query;
-    const params = [q.tripId ?? null, q.pnr ?? null, q.phone ?? null, q.status ?? null];
+    // Counter staff browse the bookings boarding at THEIR terminal (Islamabad: Islamabad → anywhere). A search by
+    // reference or phone always looks everywhere: a customer can cancel a Lahore ticket at the Islamabad counter.
+    const counter = req.user.role === 'agent';
+    if (counter && !req.user.terminalId) throw AppError.badRequest('Your account has no terminal. Ask an admin to set one.');
+    const searching = Boolean(q.pnr || q.phone);
+    const terminalId = counter ? (searching ? null : req.user.terminalId) : q.terminalId ?? null;
+    const params = [q.tripId ?? null, q.pnr ?? null, q.phone ?? null, q.status ?? null, terminalId];
     const where = `WHERE ($1::bigint IS NULL OR bk.trip_id = $1)
                      AND ($2::text IS NULL OR bk.pnr = $2)
                      AND ($3::text IS NULL OR bk.contact_phone = $3)
-                     AND ($4::booking_status IS NULL OR bk.status = $4)`;
-    const total = (await one(`SELECT count(*)::int AS n FROM bookings bk ${where}`, params)).n;
+                     AND ($4::booking_status IS NULL OR bk.status = $4)
+                     AND ($5::int IS NULL OR bs.terminal_id = $5)`;
+    const from = `FROM bookings bk
+                  JOIN trips t ON t.id = bk.trip_id
+                  JOIN routes r ON r.id = t.route_id
+                  JOIN route_stops bs ON bs.id = bk.boarding_stop_id
+                  JOIN terminals bt ON bt.id = bs.terminal_id JOIN cities bc ON bc.id = bt.city_id
+                  JOIN route_stops ds ON ds.id = bk.dropping_stop_id
+                  JOIN terminals dtm ON dtm.id = ds.terminal_id JOIN cities dc ON dc.id = dtm.city_id`;
+    const total = (await one(`SELECT count(*)::int AS n ${from} ${where}`, params)).n;
     const { rows } = await query(
       `SELECT bk.id, bk.pnr, bk.status, bk.channel, bk.contact_name, bk.contact_phone, bk.total_amount,
-              bk.created_at, t.departure_at, r.name AS route_name
-       FROM bookings bk JOIN trips t ON t.id = bk.trip_id JOIN routes r ON r.id = t.route_id
-       ${where} ORDER BY bk.created_at DESC LIMIT $5 OFFSET $6`,
+              bk.created_at, t.departure_at, r.name AS route_name,
+              bc.name AS boarding_city, dc.name AS dropping_city, bs.terminal_id AS boarding_terminal_id,
+              t.departure_at + make_interval(mins => bs.minutes_from_origin) AS boarding_at
+       ${from}
+       ${where} ORDER BY bk.created_at DESC LIMIT $6 OFFSET $7`,
       [...params, q.limit, offsetOf(q)],
     );
-    res.json(paged(rows, q, total));
+    // scope: what the list shows (the screen says "Showing bookings from Islamabad").
+    res.json({ ...paged(rows, q, total), scope: { terminalId, allTerminals: terminalId === null } });
   },
 );
 

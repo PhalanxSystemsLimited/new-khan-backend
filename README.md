@@ -547,7 +547,7 @@ Access: **public**, **C** = any signed-in user, **owner** = the booking's custom
 | POST | `/bookings/expiry-seen` | C | `{ ids: [...] }` mark "reservation expired" notice as seen |
 | GET | `/bookings/lookup?pnr&phone` | public | One booking by PNR + phone (reduced view) |
 | GET | `/bookings/lookup-phone?phone` | public | All bookings for a mobile number (no passenger details) |
-| GET | `/bookings` | S | Search bookings |
+| GET | `/bookings` | S | Search bookings (`pnr`, `phone`, `status`, `tripId`; managers also `terminalId`). Counter staff: only bookings boarding at their terminal, unless searching by `pnr` or `phone` (then every terminal). Each row has `boardingCity`, `droppingCity`, `boardingAt`; the answer has `scope` |
 | GET | `/bookings/:id` · `/bookings/:id/cancel-quote` | owner, S | Details, refund preview |
 | POST | `/bookings/:id/cancel` · `/bookings/:id/review` | owner, S | Cancel / review a completed trip |
 | POST | `/tickets/:id/board` | S | Mark passenger boarded |
