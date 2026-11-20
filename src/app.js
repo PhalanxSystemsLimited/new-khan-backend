@@ -88,8 +88,9 @@ export function createApp() {
 
   app.use(compression());
 
-  // ---- Health check (no rate limit, no auth) ----
+  // ---- Health check (no rate limit, no auth). Also the uptime monitor's link (keeps the API and DB connection awake). ----
   app.get('/health', async (_req, res) => {
+    res.set('Cache-Control', 'no-store'); // every ping must reach the server, never a cache
     try {
       await pool.query('SELECT 1');
       res.json({ status: 'ok' });
