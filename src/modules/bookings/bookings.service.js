@@ -7,6 +7,7 @@ import { cnicDigits, cnicDisplay, cnicMasked } from '../../utils/cnic.js';
 import { sendSms, smsEnabled } from '../../utils/sms.js';
 import { findFare } from '../fares/fares.service.js';
 import { seatOrder } from '../../utils/seats.js';
+import { slipsOfBooking } from '../loads/loads.service.js';
 
 const MAX_PENDING_PER_USER = 3;
 const round2 = (n) => Math.round(n * 100) / 100;
@@ -54,7 +55,8 @@ export async function getBookingDetail(id, client) {
   );
   // The full CNIC never leaves the server: staff confirm it by typing it in (see counterCancel).
   const { holderCnic, ...rest } = booking;
-  return { ...rest, holderCnicMasked: cnicMasked(holderCnic), tickets, payments, refunds };
+  const loadSlips = await slipsOfBooking(id, client); // extra luggage paid (LD slips), cancelled ones included
+  return { ...rest, holderCnicMasked: cnicMasked(holderCnic), tickets, payments, refunds, loadSlips };
 }
 
 export function assertCanAccess(booking, user) {
@@ -466,6 +468,8 @@ export async function getCounterQuote(id, staff) {
       canApproveWithoutCnic: !bk.holderCnic && isManager(staff),
       holderCnicMasked: cnicMasked(bk.holderCnic),
       phoneMasked: maskPhone(bk.contactPhone),
+      // Extra load slips still counted: the counter warns to cancel them too when refunding.
+      loadSlips: (await slipsOfBooking(bk.id, client)).filter((s) => s.status === 'active').map((s) => ({ id: s.id, slipNo: s.slipNo, amount: s.amount, takenBy: s.takenBy, onVoucher: Boolean(s.voucherId) })),
     };
   });
 }

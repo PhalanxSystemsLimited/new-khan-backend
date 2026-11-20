@@ -17,6 +17,7 @@ import { qrSvg } from '../roundtrips/roundtrips.service.js';
 import { cargoListsReady, closeListForVoucher, moveListToVoucher, openListTotals } from '../cargo/cargo.lists.js';
 import { seatOrder } from '../../utils/seats.js';
 import { confirmedSql, CONFIRM_FIRST } from '../trips/busConfirm.js';
+import { attachSlipsToVoucher, counterSlips, moveSlipsToVoucher } from '../loads/loads.service.js';
 
 /** Paid seats: a ticket is only confirmed once its booking is paid; boarded and no-show were paid too. */
 export const PAID = `('confirmed', 'boarded', 'no_show')`;
@@ -218,7 +219,9 @@ export async function generateVoucher(client, { tripId, boardingStopId, loadAmou
   // With a cargo list, the voucher's Cargo is the list's PAID total (not typed); the list closes with the voucher.
   const cargoReady = await cargoListsReady(client);
   const list = cargoReady ? await openListTotals(client, tripId, boardingStopId) : null;
-  const snap = buildSnapshot({ stops, passengers, stop, deductions, loadAmount, cargoAmount: list ? list.paidTotal : cargoAmount });
+  // Load = the total of this terminal's extra load slips (not typed) once load slips are set up; the slips freeze on it.
+  const slips = await counterSlips(client, { tripId, stopId: boardingStopId });
+  const snap = buildSnapshot({ stops, passengers, stop, deductions, loadAmount: slips ? slips.total : loadAmount, cargoAmount: list ? list.paidTotal : cargoAmount });
   const voucher = await insertVoucher(client, {
     ...snap,
     tripId,
@@ -237,7 +240,8 @@ export async function generateVoucher(client, { tripId, boardingStopId, loadAmou
   const cargoList = cargoReady
     ? await closeListForVoucher(client, { tripId, stopId: boardingStopId, voucher, busNo: trip.registrationNo, stopCity: stop.city, user })
     : null;
-  return { ...voucher, cargoList };
+  const loadSlips = slips ? await attachSlipsToVoucher(client, { tripId, stopId: boardingStopId, voucherId: voucher.id }) : null;
+  return { ...voucher, cargoList, loadSlips };
 }
 
 /** Bus swap: the voucher is replaced by a new one with the same details and the trip's current bus. */
@@ -274,6 +278,8 @@ export async function replaceVoucher(client, { voucherId, reason, user }) {
   });
   // The bus's cargo list moves to the new voucher and bus.
   if (await cargoListsReady(client)) await moveListToVoucher(client, { oldVoucherId: old.id, voucher: fresh, busNo: trip.registrationNo, user });
+  // ...and so do its extra load slips.
+  await moveSlipsToVoucher(client, { oldVoucherId: old.id, newVoucherId: fresh.id });
   return { old, fresh };
 }
 

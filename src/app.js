@@ -33,6 +33,7 @@ import { adminEmployeesRouter, crewRouter } from './modules/employees/employees.
 import { dayPlanRouter } from './modules/dayplan/dayPlan.routes.js';
 import { homeRouter } from './modules/home/home.routes.js';
 import { cargoRouter } from './modules/cargo/cargo.routes.js';
+import { loadSlipsRouter } from './modules/loads/loads.routes.js';
 import { runExpiryOnce } from './jobs/expireBookings.js';
 
 export function createApp() {
@@ -157,6 +158,7 @@ export function createApp() {
   api.use('/admin/employees', adminEmployeesRouter);
   api.use('/admin/day-plan', dayPlanRouter);
   api.use('/cargo', cargoRouter);
+  api.use('/load-slips', loadSlipsRouter);
   api.use('/', homeRouter); // /counter/departures, /me/trips, /board
   api.use('/employees', crewRouter);
   api.use('/admin', adminRoutes);

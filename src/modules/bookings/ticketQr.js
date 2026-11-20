@@ -19,6 +19,7 @@ import { cnicMasked } from '../../utils/cnic.js';
 import { qrSvg } from '../roundtrips/roundtrips.service.js';
 import { seatOrder } from '../../utils/seats.js';
 import { confirmedSql } from '../trips/busConfirm.js';
+import { slipsOfBooking } from '../loads/loads.service.js';
 
 let ready = false;
 let checkedAt = 0;
@@ -140,5 +141,7 @@ export async function checkTicket(token, user, client) {
     paidAmount: payments.reduce((s, p) => s + Number(p.amount), 0),
     paidBy: [...new Set(payments.map((p) => p.method))],
     seats: tickets.map((t) => ({ seat: t.seatNumber, name: t.passengerName, status: t.status, boardedAt: t.boardedAt, cancelled: t.status === 'cancelled' })),
+    // Extra luggage paid (active LD slips).
+    loadSlips: (await slipsOfBooking(b.id, client)).filter((s) => s.status === 'active').map((s) => ({ slipNo: s.slipNo, amount: s.amount, pieces: s.pieces, weightKg: s.weightKg, takenBy: s.takenBy, stopCity: s.stopCity })),
   };
 }

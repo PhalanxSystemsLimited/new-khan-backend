@@ -10,7 +10,8 @@
  *   income terminal      = terminal cash (paid in cash at the counter)
  *   online sale          = seats paid online, under "Web app"
  *   passengers/income en route = the conductor's road passengers who boarded after that terminal
- *   load, cargo          = voucher
+ *   load                 = voucher (the counter's extra load slips) + the conductor's load slips after that terminal
+ *   cargo                = voucher
  *   on-route expenses    = the voucher's terminal deductions (Adda, loader, cleaner...)
  * A replaced voucher is swapped for its replacement, a void one is removed. Rows an admin changed by hand are left
  * alone unless includeEdited is set. Diesel, E-tag / toll tax, mobil oil, other expense/income and the cashier stay
@@ -21,6 +22,7 @@ import { AppError } from '../../utils/AppError.js';
 import { loadTrip, voucherStops } from '../tripvouchers/tripVouchers.service.js';
 import { copyOffrouteDefaults, issueToken } from './roundtrips.service.js';
 import { confirmedSql } from '../trips/busConfirm.js';
+import { conductorLoadAt } from '../loads/loads.service.js';
 
 const TZ = 'Asia/Karachi';
 const pkDate = (d) => new Date(d).toLocaleDateString('en-CA', { timeZone: TZ });
@@ -150,7 +152,7 @@ async function figuresFor(client, tv) {
     paxEnroute: road.pax,
     incTerminal: tv.terminalCash,
     incEnroute: road.income,
-    loadAmount: tv.loadAmount,
+    loadAmount: (Number(tv.loadAmount) || 0) + (await conductorLoadAt(client, { tripId: tv.tripId, stopId: tv.boardingStopId })),
     cargoAmount: tv.cargoAmount,
     onroute: deductions.rows,
     online: online.seats || online.amount ? [{ seats: online.seats, amount: online.amount }] : [],

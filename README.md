@@ -349,6 +349,17 @@ conductor. A replacement voucher (bus swap) needs a manager or admin and a reaso
 opens the trip by voucher number at `/admin/conductor` and books road passengers (channel `on_road`, fare typed in or free), which
 blocks those seats for every later terminal.
 
+**Extra load slips** (`src/modules/loads/`, migration `2026-11-24-load-slips.sql`): a passenger's extra luggage, paid for and tied
+to their booking, with its own number (**LD-000001**, from a counter row: no gaps) and a printed slip. Counter staff (their own
+terminal) or a manager add a slip to a **paid** booking that boards at that terminal, until that terminal's voucher is generated.
+The voucher's **Load is then the total of those slips** (no longer typed; the typed value is ignored) and the slips are frozen on it
+(`voucher_id`); a replacement voucher takes them over. The trip's conductor (or stand-in, or a manager) can add a slip on the bus once
+the first voucher is generated and until the trip arrives: that cash stays with him, so it is on no terminal voucher; the round trip
+report adds it to the Load of the stage where it was taken (`stop_id` = the last terminal the bus left). A slip is never deleted: it is
+cancelled with a reason (counter slip: that terminal's counter staff before the voucher, a manager after; conductor slip: the conductor
+before arrival, a manager any time). Every add / cancel locks the trip row like voucher generation, so a voucher's Load always equals
+its slips (tested with 40 simultaneous slips racing the voucher). Until the migration runs, Load is typed as before.
+
 ### 6.6 Website content
 
 Text visitors read (contact details, terminals page, destinations with fares and times, FAQ, About items, policies) is built into
@@ -526,6 +537,10 @@ Access: **public**, **C** = any signed-in user, **owner** = the booking's custom
 | GET · POST · DELETE | `/cargo/loading/:tripId/:stopId[/parcels/:parcelId]` | CG (GET also S) | Bus cargo list at a terminal: view, add a parcel (`{ parcel: "CG-…" }` or a scanned link), take one off. Only parcels booked there, going to a later stop; counter staff at their own terminal. Generating the voucher closes the list: the voucher's Cargo = the list's paid total, parcels become `loaded`. Bus swap moves the list; a cancelled trip voids it (parcels back to `booked`) |
 | GET | `/cargo/lists[/:id]` | CG (`/:id` also S) | Find cargo lists (CL number, bus, terminal, status, dates) · one list with its parcels and QR (printed list) |
 | GET · POST | `/cargo/arrivals` · `/cargo/arrivals/receive` | CG | At the destination: buses bringing parcels, waiting for collection (overdue after the settings' days), today's hand-overs · tick parcels off the bus (`{ parcelIds }` or `{ parcel }`; only `loaded` parcels addressed here; all or nothing) |
+| GET | `/load-slips/find?q=` | S | Extra load: the booking from a reference (NK…), ticket number, scanned ticket QR or LD number, its slips, and whether this user may add one now (`canAdd`, `whyNot`) |
+| POST | `/load-slips` | S | Add a counter slip `{ bookingId, amount, pieces?, weightKg?, note? }` (own terminal, paid booking, before that terminal's voucher) |
+| GET · POST | `/load-slips/:id` · `/load-slips/:id/cancel` | S, conductor | One slip for the screen / print (with the ticket's QR; conductors: their trips) · cancel `{ reason }` |
+| POST | `/conductor/tickets/:ticketId/load-slips` | conductor | Extra load paid on the bus (same body); stage = last terminal left |
 | POST | `/cargo/parcels/:id/deliver` · `/cargo/parcels/:id/return` | CG | Hand over `{ proof: receiver_cnic \| slip, collectorName, collectorCnic, cashReceived }` (receiver's CNIC must match if given at booking; receiver-pays only once the money is taken, counted for this terminal) · return an uncollected parcel to the sender `{ reason }`. Counter staff: own terminal |
 | POST | `/bookings` | C, S | Hold seats → `pending` booking |
 | GET | `/bookings/me` | C | Own bookings (incl. `holdExpiresAt`, `expirySeenAt`, `paymentReceived`) |

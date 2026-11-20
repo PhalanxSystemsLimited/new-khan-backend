@@ -3,6 +3,7 @@
  *   GET  /conductor/voucher/:no               open the trip of a voucher number: seat map, passengers, stops
  *   POST /conductor/trips/:tripId/passengers  book a road passenger on an empty seat (fare typed in, or free)
  *   POST /conductor/tickets/:ticketId/no-show passenger did not travel, with a note
+ *   POST /conductor/tickets/:ticketId/load-slips  extra load paid on the bus (an LD slip on the passenger's booking)
  * Who may use it: the trip's conductor (their login is linked on the Conductors page), the trip's stand-in staff
  * member, and managers and admins for any trip.
  */
@@ -16,6 +17,8 @@ import { audit } from '../../utils/audit.js';
 import { bigIdParam, cnic, gender, intId, personName, phone, text, uuid } from '../../utils/schemas.js';
 import { cnicDigits } from '../../utils/cnic.js';
 import { loadTrip } from '../tripvouchers/tripVouchers.service.js';
+import { addConductorSlip, loadSlipsReady, slipsOfTrip } from '../loads/loads.service.js';
+import { slipBody } from '../loads/loads.routes.js';
 
 const router = Router();
 router.use(requireAuth, requireRole(...EMPLOYEE_ROLES));
@@ -51,7 +54,8 @@ async function tripView(tripId, user) {
     query(`SELECT id, seat_number, row_no, col_no, deck, kind, is_bookable FROM layout_seats WHERE layout_id = $1 ORDER BY deck, row_no, col_no`, [trip.layoutId]),
     query(
       `SELECT tk.id, tk.seat_id, tk.passenger_name, tk.passenger_gender, tk.passenger_phone, tk.fare_amount, tk.status,
-              tk.is_free, tk.no_show_note, bk.boarding_stop_id, bk.dropping_stop_id, bk.channel::text AS channel, bk.pnr
+              tk.is_free, tk.no_show_note, bk.boarding_stop_id, bk.dropping_stop_id, bk.channel::text AS channel, bk.pnr,
+              bk.id AS booking_id, bk.status::text AS booking_status
        FROM tickets tk JOIN bookings bk ON bk.id = tk.booking_id
        WHERE tk.trip_id = $1 AND tk.status IN ('held', 'reserved', 'confirmed', 'boarded', 'no_show')
        ORDER BY tk.created_at`,
@@ -60,6 +64,8 @@ async function tripView(tripId, user) {
     query(`SELECT id, voucher_no, boarding_stop_id, terminal_name, status, generated_at FROM trip_vouchers WHERE trip_id = $1 AND status = 'generated' ORDER BY generated_at`, [tripId]),
   ]);
   const from = await lastVoucherStop(tripId, stops);
+  const loads = await slipsOfTrip(tripId); // booking id -> its active extra load slips
+  const loadSlipsOn = Boolean(await loadSlipsReady());
   const passengerOf = (t) => ({
     ticketId: t.id,
     name: t.passengerName,
@@ -75,6 +81,11 @@ async function tripView(tripId, user) {
     onRoad: t.channel === 'on_road',
     noShowNote: t.noShowNote,
     pnr: t.pnr,
+    bookingId: t.bookingId,
+    // Extra load: the booking's slips (one booking can be a family on several seats).
+    loadSlips: loads.get(t.bookingId) ?? [],
+    canAddLoad: loadSlipsOn && Boolean(from) && !['arrived', 'cancelled'].includes(trip.status)
+      && ['confirmed', 'boarded'].includes(t.status) && t.bookingStatus === 'confirmed',
   });
   return {
     trip: {
@@ -201,6 +212,20 @@ router.post(
       return { ticketId: t.id };
     });
     res.json({ data: out });
+  },
+);
+
+/** Extra load paid on the bus: an LD slip on the passenger's booking (the cash stays with the conductor). */
+router.post(
+  '/tickets/:ticketId/load-slips',
+  validate({ params: z.object({ ticketId: uuid }).strict(), body: z.object(slipBody).strict() }),
+  async (req, res) => {
+    const out = await withTransaction(async (client) => {
+      const s = await addConductorSlip(client, { ticketId: req.valid.params.ticketId, ...req.valid.body, user: req.user });
+      await audit({ req, client, action: 'load_slip.add', entityType: 'load_slip', entityId: s.slipNo, newData: { ...req.valid.body, ticketId: req.valid.params.ticketId, takenBy: 'conductor' } });
+      return s;
+    });
+    res.status(201).json({ data: out });
   },
 );
 

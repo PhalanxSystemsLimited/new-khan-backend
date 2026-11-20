@@ -23,6 +23,7 @@ import {
 } from './tripVouchers.service.js';
 import { closePreviousRoundTrip } from '../roundtrips/roundtrips.sync.js';
 import { cargoListsReady, openListTotals } from '../cargo/cargo.lists.js';
+import { counterSlips } from '../loads/loads.service.js';
 
 const router = Router();
 router.use(requireAuth, requireRole(...STAFF_ROLES));
@@ -170,7 +171,9 @@ router.get('/:id', validate({ params: bigIdParam }), async (req, res) => {
       : l
         ? { listId: l.id, listNo: l.listNo, status: l.status, parcelCount: open ? open.parcelCount : l.status === 'open' ? 0 : l.parcelCount, paidTotal: open ? open.paidTotal : l.status === 'open' ? 0 : l.paidTotal, toPayTotal: open ? open.toPayTotal : l.status === 'open' ? 0 : l.toPayTotal }
         : { listId: null, parcelCount: 0, paidTotal: 0, toPayTotal: 0, status: null };
-    const preview = live ? null : buildSnapshot({ stops, passengers, stop: s, deductions: await terminalDeductions(s.terminalId), cargoAmount: cargo?.paidTotal ?? 0 });
+    // Extra load slips: open ones make the preview's Load; a generated voucher shows the ones frozen on it.
+    const load = await counterSlips(undefined, { tripId: id, stopId: s.id, voucherId: live?.id ?? null });
+    const preview = live ? null : buildSnapshot({ stops, passengers, stop: s, deductions: await terminalDeductions(s.terminalId), loadAmount: load?.total ?? 0, cargoAmount: cargo?.paidTotal ?? 0 });
     terminals.push({
       stopId: s.id,
       terminalId: s.terminalId,
@@ -181,6 +184,7 @@ router.get('/:id', validate({ params: bigIdParam }), async (req, res) => {
       history,
       preview,
       cargo, // null: cargo not set up; parcelCount > 0: the voucher's Cargo comes from the list
+      load, // null: load slips not set up (Load typed by hand); else { count, total, slips }: the voucher's Load
       canGenerate: !live && canGenerateAt(req.user, s) && !['cancelled', 'arrived'].includes(trip.status),
     });
   }
@@ -255,7 +259,10 @@ router.post(
     const b = req.valid.body;
     const made = await withTransaction(async (client) => {
       const v = await generateVoucher(client, { tripId: req.valid.params.id, ...b, user: req.user });
-      const fromList = v.cargoList ? { cargoAmount: v.cargoList.paidTotal, cargoListNo: v.cargoList.listNo, cargoParcels: v.cargoList.parcelCount } : {};
+      const fromList = {
+        ...(v.cargoList ? { cargoAmount: v.cargoList.paidTotal, cargoListNo: v.cargoList.listNo, cargoParcels: v.cargoList.parcelCount } : {}),
+        ...(v.loadSlips ? { loadAmount: v.loadSlips.total, loadSlips: v.loadSlips.count } : {}),
+      };
       await audit({ req, client, action: 'trip_voucher.generate', entityType: 'trip_voucher', entityId: v.id, newData: { voucherNo: v.voucherNo, tripId: req.valid.params.id, ...b, ...fromList } });
       // The bus is leaving its first terminal: if that is Lahore or Multan, a round trip nobody marked as arrived is closed.
       const first = await one(`SELECT 1 FROM route_stops rs JOIN trips t ON t.route_id = rs.route_id WHERE t.id = $1 AND rs.id = $2 AND rs.stop_order = 1`, [req.valid.params.id, b.boardingStopId], client);
