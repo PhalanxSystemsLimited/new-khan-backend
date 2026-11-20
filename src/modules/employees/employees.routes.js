@@ -47,6 +47,9 @@ const employeeFields = {
   leftOn: opt(isoDate),
 };
 const createSchema = z.object(employeeFields).strict();
+/** Every employee needs a CNIC (new ones on adding; older ones without one are asked for it on their next edit). */
+const CNIC_REQUIRED = 'Enter the CNIC (13 digits, like 35202-1234567-1). Every employee needs one.';
+const cnicRequired = () => AppError.badRequest(CNIC_REQUIRED, [{ field: 'cnic', message: CNIC_REQUIRED }]);
 const updateSchema = z.object(employeeFields).partial().strict();
 
 const COLS = {
@@ -63,6 +66,7 @@ const SELECT = `
          (e.licence_expiry IS NOT NULL AND e.licence_expiry < CURRENT_DATE) AS licence_expired,
          (e.licence_expiry IS NOT NULL AND e.licence_expiry >= CURRENT_DATE AND e.licence_expiry < CURRENT_DATE + 30) AS licence_expiring,
          (e.cnic_expiry IS NOT NULL AND e.cnic_expiry < CURRENT_DATE + 30) AS cnic_expiring,
+         (e.cnic IS NULL) AS cnic_missing,
          dr.id AS driver_id, cn.id AS conductor_id
   FROM employees e
   LEFT JOIN departments d ON d.id = e.department_id
@@ -154,13 +158,14 @@ adminEmployeesRouter.get(
                           OR e.cnic LIKE '%' || $1 || '%' OR e.phone LIKE '%' || $1 || '%')
                      AND ($2::int IS NULL OR e.designation_id = $2)
                      AND ($3::text = 'all' OR ($3::text = 'active') = e.is_active)
-                     AND (NOT $4::boolean OR (e.licence_expiry < CURRENT_DATE + 30 OR e.cnic_expiry < CURRENT_DATE + 30))`;
+                     AND (NOT $4::boolean OR (e.licence_expiry < CURRENT_DATE + 30 OR e.cnic_expiry < CURRENT_DATE + 30 OR e.cnic IS NULL))`;
     const params = [q.q || null, q.designationId ?? null, q.status, Boolean(q.expiring)];
     const total = (await one(`SELECT count(*)::int AS n FROM employees e ${where}`, params)).n;
     const { rows } = await query(`${SELECT} ${where} ORDER BY e.employee_code LIMIT $5 OFFSET $6`, [...params, q.limit, (q.page - 1) * q.limit]);
     const warn = await one(
       `SELECT count(*) FILTER (WHERE licence_expiry < CURRENT_DATE + 30)::int AS licences,
-              count(*) FILTER (WHERE cnic_expiry < CURRENT_DATE + 30)::int AS cnics
+              count(*) FILTER (WHERE cnic_expiry < CURRENT_DATE + 30)::int AS cnics,
+              count(*) FILTER (WHERE cnic IS NULL)::int AS cnics_missing
        FROM employees WHERE is_active`,
     );
     res.json({ data: rows, warnings: warn, pagination: { page: q.page, limit: q.limit, total, totalPages: Math.ceil(total / q.limit) } });
@@ -285,6 +290,7 @@ adminEmployeesRouter.get('/:id', validate({ params: idParam }), async (req, res)
 
 adminEmployeesRouter.post('/', validate({ body: createSchema }), async (req, res) => {
   const b = req.valid.body;
+  if (!b.cnic) throw cnicRequired();
   const made = await withTransaction(async (client) => {
     const fields = Object.keys(COLS).filter((k) => b[k] !== undefined);
     const cols = fields.map((k) => COLS[k]);
@@ -309,6 +315,9 @@ adminEmployeesRouter.patch('/:id', validate({ params: idParam, body: updateSchem
   await withTransaction(async (client) => {
     const before = await one(`SELECT * FROM employees WHERE id = $1 FOR UPDATE`, [id], client);
     if (!before) throw AppError.notFound('Employee not found');
+    // A CNIC cannot be removed; an employee without one gets it on this edit (a change that leaves it out, like
+    // marking someone as left, still works).
+    if (b.cnic === null) throw cnicRequired();
     const fields = Object.keys(COLS).filter((k) => b[k] !== undefined);
     if (!fields.length) throw AppError.badRequest('Nothing to change');
     await client.query(
