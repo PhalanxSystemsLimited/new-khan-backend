@@ -4,7 +4,7 @@
  * Rules:
  *  - One list per trip per terminal (like vouchers). It is made when the first parcel is put on it.
  *  - Only parcels BOOKED AT THAT TERMINAL, still waiting there (status booked, on no list), going to a later stop
- *    of the bus's route can be put on it. Counter staff only at their own terminal; managers and admins anywhere
+ *    of the bus's route can be put on it. Cargo staff only at their own terminal; managers and admins anywhere
  *    (same as generating the voucher).
  *  - Parcels can be added and removed until the terminal generates its voucher. Generating it closes the list:
  *    the voucher's Cargo amount is the list's PAID total (receiver-pays parcels are collected at the destination),
@@ -70,8 +70,8 @@ async function tripAndStop(client, tripId, stopId, { lock = false } = {}) {
   return { trip, stop, later: stops.slice(i + 1) };
 }
 
-/** Counter staff only at their own terminal; managers and admins anywhere (as for vouchers). */
-const canLoadAt = (user, stop) => MANAGERS.includes(user.role) || (user.role === 'agent' && Boolean(user.terminalId) && user.terminalId === stop.terminalId);
+/** Cargo staff only at their own terminal; managers and admins anywhere. Counter staff: view only. */
+const canLoadAt = (user, stop) => MANAGERS.includes(user.role) || (user.role === 'cargo' && Boolean(user.terminalId) && user.terminalId === stop.terminalId);
 
 const LIST_TOTALS = `
   count(*)::int AS parcel_count,
@@ -161,7 +161,7 @@ const frozenTotals = (l) => ({
 /** Why a list cannot change right now (or null). Run with the trip locked. */
 async function checkCanEdit(client, { trip, stop, user }) {
   if (!canLoadAt(user, stop)) {
-    throw AppError.forbidden(user.terminalId ? `Only ${stop.city} counter staff (or a manager) can load cargo here.` : 'Your account has no terminal. Ask an admin to set one.');
+    throw AppError.forbidden(user.terminalId ? `Only ${stop.city} cargo staff (or a manager) can load cargo here.` : 'Your account has no terminal. Ask an admin to set one.');
   }
   if (['cancelled', 'arrived'].includes(trip.status)) throw AppError.unprocessable(`This trip is ${trip.status}.`);
   const v = await one(`SELECT voucher_no FROM trip_vouchers WHERE trip_id = $1 AND boarding_stop_id = $2 AND status = 'generated'`, [trip.id, stop.id], client);

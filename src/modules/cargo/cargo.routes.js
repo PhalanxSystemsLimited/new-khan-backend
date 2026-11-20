@@ -1,5 +1,6 @@
 /**
- * Cargo (staff). See cargo.service.js for the rules.
+ * Cargo: cargo staff (role 'cargo', at their terminal), managers and admins. Counter staff may only open a bus's
+ * cargo list read-only (GET /cargo/loading/... and /cargo/lists/:id). See cargo.service.js for the rules.
  *
  *   GET   /cargo/setup                  terminals, rates, settings, and which terminal this user books from
  *   PUT   /cargo/settings               rules / not-allowed text, overdue days, staff may change charge (admin)
@@ -7,7 +8,7 @@
  *   PATCH /cargo/rates/:id              change a rate (admin)
  *   GET   /cargo/quote                  the rate-table charge while the booking form is filled in
  *   GET   /cargo/parcels                search (number, phone, CNIC, name), filters, pages
- *   POST  /cargo/parcels                book a parcel (counter staff: own terminal only)
+ *   POST  /cargo/parcels                book a parcel (cargo staff: own terminal only)
  *   GET   /cargo/parcels/:id            one parcel with its history
  *   GET   /cargo/parcels/:id/slip       what the slip and labels print (with the QR code)
  *   POST  /cargo/parcels/:id/cancel     cancel a parcel not on a bus yet (reason required)
@@ -29,7 +30,7 @@ import { Router } from 'express';
 import { z } from 'zod';
 import { query, one, withTransaction } from '../../config/db.js';
 import { validate } from '../../middleware/validate.js';
-import { requireAuth, requireRole, ADMIN_ROLES, STAFF_ROLES } from '../../middleware/auth.js';
+import { requireAuth, requireRole, ADMIN_ROLES, CARGO_ROLES, STAFF_ROLES } from '../../middleware/auth.js';
 import { AppError } from '../../utils/AppError.js';
 import { audit } from '../../utils/audit.js';
 import { bigIdParam, cnic, idParam, intId, isoDate, longText, pagination, personName, phone, text } from '../../utils/schemas.js';
@@ -42,7 +43,14 @@ import { env } from '../../config/env.js';
 import { qrSvg } from '../roundtrips/roundtrips.service.js';
 
 export const cargoRouter = Router();
-cargoRouter.use(requireAuth, requireRole(...STAFF_ROLES));
+// Cargo staff (and managers / admins) do cargo. Counter staff only LOOK at a bus's cargo list (the voucher page's
+// "View cargo": the voucher takes its cargo amount from that list), never change it.
+const cargoOnly = requireRole(...CARGO_ROLES);
+const alsoCounter = requireRole(...new Set([...CARGO_ROLES, ...STAFF_ROLES]));
+const COUNTER_CAN_VIEW = [/^\/loading\/[^/]+\/[^/]+\/?$/, /^\/lists\/\d+\/?$/];
+cargoRouter.use(requireAuth, (req, res, next) =>
+  (req.method === 'GET' && COUNTER_CAN_VIEW.some((re) => re.test(req.path)) ? alsoCounter : cargoOnly)(req, res, next),
+);
 const adminOnly = requireRole(...ADMIN_ROLES);
 
 const rupees = z.number().int().min(0).max(10_000_000);
@@ -185,7 +193,7 @@ cargoRouter.get(
 
 export const parcelBody = z
   .object({
-    fromTerminalId: intId.optional(), // counter staff: their own terminal (may be left out)
+    fromTerminalId: intId.optional(), // cargo staff: their own terminal (may be left out)
     toTerminalId: intId,
     senderName: personName,
     senderPhone: phone,

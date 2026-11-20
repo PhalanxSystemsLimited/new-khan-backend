@@ -9,7 +9,7 @@ import { Router } from 'express';
 import { z } from 'zod';
 import { query, one } from '../../config/db.js';
 import { validate } from '../../middleware/validate.js';
-import { requireAuth, requireRole, EMPLOYEE_ROLES, MANAGER_ROLES, STAFF_ROLES } from '../../middleware/auth.js';
+import { requireAuth, requireRole, CARGO_ROLES, EMPLOYEE_ROLES, MANAGER_ROLES, STAFF_ROLES, TERMINAL_ROLES } from '../../middleware/auth.js';
 import { AppError } from '../../utils/AppError.js';
 import { intId, isoDate } from '../../utils/schemas.js';
 import { cargoForDepartures, cargoListsReady } from '../cargo/cargo.lists.js';
@@ -30,13 +30,15 @@ export const homeRouter = Router();
 homeRouter.get(
   '/counter/departures',
   requireAuth,
-  requireRole(...STAFF_ROLES),
+  // Counter staff (selling) and cargo staff (the Cargo screen: the same buses, loading cargo) both use this list.
+  requireRole(...new Set([...STAFF_ROLES, ...CARGO_ROLES])),
   validate({ query: z.object({ date: isoDate.optional(), terminalId: intId.optional() }).strict() }),
   async (req, res) => {
     const date = req.valid.query.date ?? today();
-    // Counter staff: always their own terminal. Managers and admins: the one they pick (or their own).
-    const terminalId = req.user.role === 'agent' ? req.user.terminalId : req.valid.query.terminalId ?? req.user.terminalId;
-    if (!terminalId) throw AppError.badRequest(req.user.role === 'agent' ? 'Your account has no terminal. Ask an admin to set one.' : 'Choose a terminal.');
+    // Counter and cargo staff: always their own terminal. Managers and admins: the one they pick (or their own).
+    const own = TERMINAL_ROLES.includes(req.user.role);
+    const terminalId = own ? req.user.terminalId : req.valid.query.terminalId ?? req.user.terminalId;
+    if (!terminalId) throw AppError.badRequest(own ? 'Your account has no terminal. Ask an admin to set one.' : 'Choose a terminal.');
     const terminal = await one(`SELECT t.id, t.name, c.name AS city FROM terminals t JOIN cities c ON c.id = t.city_id WHERE t.id = $1`, [terminalId]);
     if (!terminal) throw AppError.notFound('Terminal not found');
 

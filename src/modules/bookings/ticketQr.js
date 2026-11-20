@@ -117,7 +117,7 @@ export async function checkTicket(token, user, client) {
     seats: tickets.map((t) => ({ seat: t.seatNumber, name: t.passengerName, cancelled: t.status === 'cancelled' })),
     staff: false,
   };
-  if (!isEmployee(user)) return pub;
+  if (!isEmployee(user) || user.role === 'cargo') return pub; // cargo staff do not handle tickets
 
   const { rows: payments } = await query(
     `SELECT method, amount FROM payments WHERE booking_id = $1 AND status IN ('succeeded', 'refunded', 'partially_refunded')`,

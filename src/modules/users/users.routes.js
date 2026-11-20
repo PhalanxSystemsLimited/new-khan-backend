@@ -13,8 +13,8 @@ const router = Router();
 const PROFILE_COLUMNS = `id, full_name, email, phone, role, cnic, gender, date_of_birth, terminal_id,
   is_active, email_verified, phone_verified, last_login_at, created_at, updated_at`;
 
-/** Every role, in order. 'agent' is shown as "Counter staff". */
-const ROLES = ['customer', 'agent', 'driver', 'conductor', 'manager', 'admin', 'super_admin'];
+/** Every role, in order. 'agent' is shown as "Counter staff", 'cargo' as "Cargo staff". */
+const ROLES = ['customer', 'agent', 'cargo', 'driver', 'conductor', 'manager', 'admin', 'super_admin'];
 /** Roles only a super admin may give or take away. */
 const PRIVILEGED = ['manager', 'admin', 'super_admin'];
 
@@ -134,8 +134,9 @@ router.patch(
     }
 
     let terminalId = req.valid.body.terminalId !== undefined ? req.valid.body.terminalId : target.terminalId;
-    if (!['agent', 'manager'].includes(role)) terminalId = null; // only counter staff and managers work at a terminal
+    if (!['agent', 'cargo', 'manager'].includes(role)) terminalId = null; // only counter / cargo staff and managers work at a terminal
     if (role === 'agent' && !terminalId) throw AppError.badRequest('Choose the terminal this counter staff member works at.');
+    if (role === 'cargo' && !terminalId) throw AppError.badRequest('Choose the terminal this cargo staff member works at.');
     if (terminalId) {
       const t = await one(`SELECT id FROM terminals WHERE id = $1 AND is_active`, [terminalId]);
       if (!t) throw AppError.badRequest('Terminal not found or inactive');

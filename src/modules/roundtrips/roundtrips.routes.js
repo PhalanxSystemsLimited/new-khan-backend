@@ -806,8 +806,8 @@ publicReportRouter.get('/r/:token', optionalAuth, async (req, res) => {
   // Login first (unless the public view is switched on), so the answer never says whether a token exists.
   if (!env.PUBLIC_TRIP_REPORT) {
     if (!req.user) throw AppError.unauthorized('Sign in with a staff account to open this report.');
-    // Staff and conductors; not drivers (the report holds the trip's money).
-    if (!isEmployee(req.user) || req.user.role === 'driver') throw AppError.forbidden('Only New Khan staff can open trip reports.');
+    // Staff and conductors; not drivers or cargo staff (the report holds the trip's money).
+    if (!isEmployee(req.user) || ['driver', 'cargo'].includes(req.user.role)) throw AppError.forbidden('Only New Khan staff can open trip reports.');
   }
   const tokenRow = await resolveToken(req.params.token);
   if (!tokenRow) throw AppError.notFound('This report link is not valid. It may have been replaced by a new one.');

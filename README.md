@@ -327,15 +327,16 @@ expired reservation (last 7 days) and then calls `POST /bookings/expiry-seen`, w
 | Role | Can |
 |---|---|
 | `customer` | Book online, see/cancel own bookings |
-| `agent` (**Counter staff**) | Tied to one terminal (`users.terminal_id`). Counter sales (cash), bookings, manifests, boarding, vouchers; generates the terminal voucher of **their own terminal** only |
+| `agent` (**Counter staff**) | Tied to one terminal (`users.terminal_id`). Counter sales (cash), bookings, manifests, boarding, vouchers; generates the terminal voucher of **their own terminal** only. No cargo: they only **view** a bus's cargo list (voucher page) |
+| `cargo` (**Cargo staff**) | Tied to one terminal. Books parcels from it, loads cargo onto the buses leaving it (the *Cargo screen*), receives and hands over parcels arriving there. No tickets, vouchers or trip reports |
 | `conductor` | Only the conductor screen of trips they are the conductor (or stand-in) of: live seats and passengers, road passengers, no-shows |
-| `manager` | Everything counter staff can, at any terminal + trip status, bus and crew, replacement vouchers, reading refunds and reports |
+| `manager` | Everything counter staff and cargo staff can, at any terminal + trip status, bus and crew, replacement vouchers, reading refunds and reports |
 | `admin` | Everything + routes, fares, fleet, conductors, schedules, settings, deductions, promo codes, users (counter staff and conductors) |
 | `super_admin` | Everything + giving manager and admin roles |
 
 Roles are stored in `public.users.role` (never trusted from the token). Staff work in the **admin panel** of the website
 (`/admin`), which calls the endpoints below. To make someone staff: they sign up on the website, then an admin changes their role
-under *Users & staff* (counter staff also need a terminal). A conductor's login is then linked on *Fleet & people → Conductors*.
+under *Users & staff* (counter staff and cargo staff also need a terminal). A conductor's login is then linked on *Fleet & people → Conductors*.
 The very first super admin is set in SQL (§2.1 step 4). People who work but do not sign in (cleaners, loaders…) are listed in the
 *Staff directory*.
 
@@ -489,7 +490,7 @@ Every message tried is logged in `sms_messages` (number partly hidden, codes nev
 ## 9. API reference
 
 Base path **`/api/v1`**. Auth = `Authorization: Bearer <accessToken>`.
-Access: **public**, **C** = any signed-in user, **owner** = the booking's customer, **S** = staff (agent/admin/super_admin), **A** = admin.
+Access: **public**, **C** = any signed-in user, **owner** = the booking's customer, **S** = staff (agent/admin/super_admin), **CG** = cargo staff, managers and admins, **A** = admin.
 
 | Method | Path | Access | Purpose |
 |---|---|---|---|
@@ -518,14 +519,14 @@ Access: **public**, **C** = any signed-in user, **owner** = the booking's custom
 | GET | `/trips/:id/bus-options` | S | Active buses with the trip's seat layout, each with `busyTripId` (the confirmed trip it is on then) |
 | GET · POST | `/trips/extra-options?terminalId=` · `/trips/extra` | S | Extra departure for a busy day `{ routeId, departureAt, layoutId + busClass \| busId, allowNear? }`: on sale at once; without a bus it is planned (bus to confirm). Counter staff: routes leaving their terminal. Another departure on the route within 30 min → 409 `NEAR_DEPARTURE` until sent with `allowNear` |
 | PATCH | `/trips/:id/status` | S (cancel = A) | boarding / departed / arrived / delayed / cancelled. Boarding and departed need a confirmed bus (and a conductor) |
-| GET | `/cargo/setup` · `/cargo/quote` | S | Cargo: terminals, rates, settings; the rate-table charge |
+| GET | `/cargo/setup` · `/cargo/quote` | CG | Cargo: terminals, rates, settings; the rate-table charge. **CG** = cargo staff, managers and admins (not counter staff) |
 | PUT · POST · PATCH | `/cargo/settings` · `/cargo/rates[/:id]` | A | Cargo rules / not-allowed text printed on the slip, overdue days, staff may change charge; rates per city pair (per kg, per piece, minimum) |
-| GET · POST | `/cargo/parcels` | S | Search parcels (CG number or scanned QR link, phone, CNIC, name) · book a parcel (counter staff: own terminal only; lower charge needs a reason) |
-| GET · POST | `/cargo/parcels/:id[/slip]` · `/cargo/parcels/:id/cancel` | S | A parcel with its history, slip data with QR · cancel while not on a bus (reason; counter staff: own terminal) |
-| GET · POST · DELETE | `/cargo/loading/:tripId/:stopId[/parcels/:parcelId]` | S | Bus cargo list at a terminal: view, add a parcel (`{ parcel: "CG-…" }` or a scanned link), take one off. Only parcels booked there, going to a later stop; counter staff at their own terminal. Generating the voucher closes the list: the voucher's Cargo = the list's paid total, parcels become `loaded`. Bus swap moves the list; a cancelled trip voids it (parcels back to `booked`) |
-| GET | `/cargo/lists[/:id]` | S | Find cargo lists (CL number, bus, terminal, status, dates) · one list with its parcels and QR (printed list) |
-| GET · POST | `/cargo/arrivals` · `/cargo/arrivals/receive` | S | At the destination: buses bringing parcels, waiting for collection (overdue after the settings' days), today's hand-overs · tick parcels off the bus (`{ parcelIds }` or `{ parcel }`; only `loaded` parcels addressed here; all or nothing) |
-| POST | `/cargo/parcels/:id/deliver` · `/cargo/parcels/:id/return` | S | Hand over `{ proof: receiver_cnic \| slip, collectorName, collectorCnic, cashReceived }` (receiver's CNIC must match if given at booking; receiver-pays only once the money is taken, counted for this terminal) · return an uncollected parcel to the sender `{ reason }`. Counter staff: own terminal |
+| GET · POST | `/cargo/parcels` | CG | Search parcels (CG number or scanned QR link, phone, CNIC, name) · book a parcel (cargo staff: own terminal only; lower charge needs a reason) |
+| GET · POST | `/cargo/parcels/:id[/slip]` · `/cargo/parcels/:id/cancel` | CG | A parcel with its history, slip data with QR · cancel while not on a bus (reason; cargo staff: own terminal) |
+| GET · POST · DELETE | `/cargo/loading/:tripId/:stopId[/parcels/:parcelId]` | CG (GET also S) | Bus cargo list at a terminal: view, add a parcel (`{ parcel: "CG-…" }` or a scanned link), take one off. Only parcels booked there, going to a later stop; counter staff at their own terminal. Generating the voucher closes the list: the voucher's Cargo = the list's paid total, parcels become `loaded`. Bus swap moves the list; a cancelled trip voids it (parcels back to `booked`) |
+| GET | `/cargo/lists[/:id]` | CG (`/:id` also S) | Find cargo lists (CL number, bus, terminal, status, dates) · one list with its parcels and QR (printed list) |
+| GET · POST | `/cargo/arrivals` · `/cargo/arrivals/receive` | CG | At the destination: buses bringing parcels, waiting for collection (overdue after the settings' days), today's hand-overs · tick parcels off the bus (`{ parcelIds }` or `{ parcel }`; only `loaded` parcels addressed here; all or nothing) |
+| POST | `/cargo/parcels/:id/deliver` · `/cargo/parcels/:id/return` | CG | Hand over `{ proof: receiver_cnic \| slip, collectorName, collectorCnic, cashReceived }` (receiver's CNIC must match if given at booking; receiver-pays only once the money is taken, counted for this terminal) · return an uncollected parcel to the sender `{ reason }`. Counter staff: own terminal |
 | POST | `/bookings` | C, S | Hold seats → `pending` booking |
 | GET | `/bookings/me` | C | Own bookings (incl. `holdExpiresAt`, `expirySeenAt`, `paymentReceived`) |
 | POST | `/bookings/expiry-seen` | C | `{ ids: [...] }` mark "reservation expired" notice as seen |

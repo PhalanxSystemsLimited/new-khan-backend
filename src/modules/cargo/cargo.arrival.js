@@ -10,7 +10,7 @@
  *      slip           someone with the slip or a picture of it, who gives their own CNIC
  *    A receiver-pays parcel is handed over only when the money is taken (it counts for this terminal, today).
  *  - Not collected: "returned" with a reason (it shows as overdue after the settings' overdue days).
- *  - Counter staff only at their own terminal; managers and admins at any.
+ *  - Cargo staff only at their own terminal; managers and admins at any.
  */
 import { query, one } from '../../config/db.js';
 import { AppError } from '../../utils/AppError.js';
@@ -21,7 +21,7 @@ const rs = (n) => `Rs ${Number(n).toLocaleString('en-US')}`;
 const maskCnic = (v) => String(v ?? '').replace(/^(\d{5})-?\d{7}-?(\d)$/, '$1-*******-$2');
 const cnicDigits = (v) => String(v ?? '').replace(/\D/g, '');
 
-/** The terminal this user works at for arrivals: counter staff their own; managers the one they choose. */
+/** The terminal this user works at for arrivals: cargo staff their own; managers the one they choose. */
 export function workTerminal(user, requested) {
   if (isCargoManager(user)) {
     const t = requested ?? user.terminalId;

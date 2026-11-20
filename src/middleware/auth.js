@@ -5,7 +5,8 @@ import { AppError } from '../utils/AppError.js';
 
 /*
  * Roles (see README §6.5):
- *   agent (shown as "Counter staff", tied to a terminal) · conductor · manager · admin · super_admin
+ *   agent (shown as "Counter staff", tied to a terminal) · cargo ("Cargo staff", tied to a terminal) · conductor ·
+ *   manager · admin · super_admin
  * STAFF_ROLES   = everyone who works the counter: sell, board, see bookings and vouchers.
  * MANAGER_ROLES = managers and up: trip status and crew, replacement vouchers, reports.
  * ADMIN_ROLES   = prices, routes, buses, settings.
@@ -15,7 +16,11 @@ import { AppError } from '../utils/AppError.js';
 export const STAFF_ROLES = ['agent', 'manager', 'admin', 'super_admin'];
 export const MANAGER_ROLES = ['manager', 'admin', 'super_admin'];
 export const ADMIN_ROLES = ['admin', 'super_admin'];
-export const EMPLOYEE_ROLES = ['agent', 'driver', 'conductor', 'manager', 'admin', 'super_admin'];
+/** CARGO_ROLES = cargo staff and managers and up: book parcels, load cargo, receive and hand over parcels. */
+export const CARGO_ROLES = ['cargo', 'manager', 'admin', 'super_admin'];
+/** Roles that work at one terminal (their account's terminal). */
+export const TERMINAL_ROLES = ['agent', 'cargo'];
+export const EMPLOYEE_ROLES = ['agent', 'cargo', 'driver', 'conductor', 'manager', 'admin', 'super_admin'];
 
 function extractToken(req) {
   const header = req.headers.authorization;

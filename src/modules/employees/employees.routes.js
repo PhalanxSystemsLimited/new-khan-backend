@@ -332,7 +332,7 @@ adminEmployeesRouter.patch('/:id', validate({ params: idParam, body: updateSchem
 });
 
 /** Links (or unlinks) the employee's sign-in account and gives it a role. Manager and admin roles: super admins only. */
-const LOGIN_ROLES = ['agent', 'driver', 'conductor', 'manager', 'admin'];
+const LOGIN_ROLES = ['agent', 'cargo', 'driver', 'conductor', 'manager', 'admin'];
 adminEmployeesRouter.patch(
   '/:id/login',
   validate({
@@ -356,8 +356,9 @@ adminEmployeesRouter.patch(
         }
         if (u.role === 'super_admin') throw AppError.forbidden('A super admin account cannot be linked here.');
         if (newRole === 'agent' && !terminalId) throw AppError.badRequest('Choose the terminal this counter staff member works at.');
+        if (newRole === 'cargo' && !terminalId) throw AppError.badRequest('Choose the terminal this cargo staff member works at.');
         await client.query(`UPDATE users SET role = $2, terminal_id = $3 WHERE id = $1`, [
-          userId, newRole, ['agent', 'manager'].includes(newRole) ? terminalId ?? null : null,
+          userId, newRole, ['agent', 'cargo', 'manager'].includes(newRole) ? terminalId ?? null : null,
         ]);
       }
       await client.query(`UPDATE employees SET user_id = $2 WHERE id = $1`, [id, userId]);

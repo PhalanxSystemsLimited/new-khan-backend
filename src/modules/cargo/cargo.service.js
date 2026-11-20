@@ -7,10 +7,10 @@
  *  - Charge from the rate table (per city pair): the higher of weight x rate per kg and pieces x rate per piece,
  *    never below the minimum. Staff may type a different charge (unless an admin turned that off for counter
  *    staff); a charge LOWER than the rate table needs a reason. Both charges are kept.
- *  - Counter staff book from their own terminal only (the terminal on their account), like vouchers.
+ *  - Cargo staff book from their own terminal only (the terminal on their account).
  *    Managers and admins book from any terminal.
  *  - A parcel can be cancelled (with a reason) only while it is still "booked" (not yet on a bus);
- *    counter staff only for parcels booked at their own terminal.
+ *    cargo staff only for parcels booked at their own terminal.
  */
 import { env } from '../../config/env.js';
 import { query, one } from '../../config/db.js';
@@ -74,7 +74,7 @@ export async function quote(client, { fromTerminalId, toTerminalId, weightKg, pi
   };
 }
 
-/** The terminal a parcel is booked from: counter staff only their own; managers and admins any. */
+/** The terminal a parcel is booked from: cargo staff only their own; managers and admins any. */
 function bookingTerminal(user, requested) {
   if (isCargoManager(user)) {
     if (!requested) throw AppError.badRequest('Choose the sending terminal.', [{ field: 'fromTerminalId', message: 'Choose the sending terminal.' }]);

@@ -23,7 +23,7 @@ BEGIN;
 -- ---------------------------------------------------------------------
 -- 1. ENUM TYPES
 -- ---------------------------------------------------------------------
-CREATE TYPE user_role        AS ENUM ('customer', 'agent', 'driver', 'conductor', 'manager', 'admin', 'super_admin');
+CREATE TYPE user_role        AS ENUM ('customer', 'agent', 'cargo', 'driver', 'conductor', 'manager', 'admin', 'super_admin'); -- agent = Counter staff, cargo = Cargo staff
 CREATE TYPE bus_class        AS ENUM ('economy', 'executive', 'business', 'sleeper');
 CREATE TYPE seat_kind        AS ENUM ('standard', 'window', 'aisle', 'sleeper', 'driver', 'blocked');
 CREATE TYPE trip_status      AS ENUM ('scheduled', 'boarding', 'departed', 'arrived', 'cancelled', 'delayed');
@@ -1514,6 +1514,7 @@ INSERT INTO designations (name, crew, suggested_role, sort_order) VALUES
     ('Stand Manager (SM)', NULL, 'manager', 3),
     ('ASM', NULL, 'manager', 4),
     ('Booking Officer', NULL, 'agent', 5),
+    ('Cargo Staff', NULL, 'cargo', 6),
     ('Loader', NULL, NULL, 6),
     ('Driver', 'driver', 'driver', 7),
     ('Conductor / Fare Collector', 'conductor', 'conductor', 8),
