@@ -7,6 +7,7 @@ import { env } from '../../config/env.js';
 import { autoCreateReport, closePreviousRoundTrip } from '../roundtrips/roundtrips.sync.js';
 import { assertBusFree, createExtraDeparture, createTripWithReturn } from './trips.create.js';
 import { busConfirmReady, confirmedSql, CONFIRM_FIRST } from './busConfirm.js';
+import { customRouteSchema, findOrCreateRoute } from '../routes/customRoute.js';
 import { cargoListsReady, voidListsForCancelledTrip } from '../cargo/cargo.lists.js';
 import { expireStaleSoon } from '../../jobs/expireBookings.js';
 import { searchLimiter } from '../../middleware/rateLimit.js';
@@ -216,7 +217,9 @@ router.get('/:id/seats', searchLimiter, validate({ params: bigIdParam }), async 
 // ---------------- Staff / admin ----------------
 const tripCreateSchema = z
   .object({
-    routeId: intId,
+    // A saved route, or one built from chosen locations (customRoute.js): exactly one of the two.
+    routeId: intId.optional(),
+    customRoute: customRouteSchema.optional(),
     busId: intId,
     driverId: intId.optional(),
     coDriverId: intId.optional(),
@@ -229,7 +232,8 @@ const tripCreateSchema = z
     returnTrip: z.object({ routeId: intId, departureAt: isoDateTime, driverId: intId.optional() }).strict().optional(),
   })
   .strict()
-  .refine((t) => !t.coDriverId || t.coDriverId !== t.driverId, 'Driver and co-driver must differ');
+  .refine((t) => !t.coDriverId || t.coDriverId !== t.driverId, 'Driver and co-driver must differ')
+  .refine((t) => Boolean(t.routeId) !== Boolean(t.customRoute), { path: ['routeId'], message: 'Choose a saved route, or choose the locations' });
 
 async function assertDriversValid(client, ids) {
   for (const id of ids.filter(Boolean)) {
@@ -257,12 +261,22 @@ router.post('/', ...admin, validate({ body: tripCreateSchema }), async (req, res
   if (Date.parse(b.departureAt) <= Date.now()) throw AppError.badRequest('Departure must be in the future');
 
   // With `returnTrip`, the same bus's return trip is created too: both or neither (see trips.create.js).
-  const { trip, returnTrip, warnings } = await withTransaction((client) => createTripWithReturn(client, b));
+  // A route built from chosen locations is found or created with the trip: both or neither.
+  const { trip, returnTrip, warnings, route } = await withTransaction(async (client) => {
+    const { customRoute, ...rest } = b;
+    const built = customRoute ? await findOrCreateRoute(client, customRoute) : null;
+    const made = await createTripWithReturn(client, built ? { ...rest, routeId: built.id } : rest);
+    return { ...made, route: built };
+  });
+  if (route?.created) {
+    await audit({ req, action: 'route.create', entityType: 'route', entityId: route.id, newData: { code: route.code, name: route.name, ...b.customRoute, builtFor: 'trip' } });
+  }
   await audit({ req, action: 'trip.create', entityType: 'trip', entityId: trip.id, newData: trip });
   if (returnTrip) {
     await audit({ req, action: 'trip.create', entityType: 'trip', entityId: returnTrip.id, newData: { ...returnTrip, returnOfTripId: trip.id } });
   }
-  res.status(201).json({ data: trip, returnTrip, warnings });
+  // `route` (only when locations were chosen): { id, code, name, created, hasFares }.
+  res.status(201).json({ data: trip, returnTrip, warnings, route });
 });
 
 router.get(

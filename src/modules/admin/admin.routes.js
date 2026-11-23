@@ -39,6 +39,20 @@ router.get('/routes', async (_req, res) => {
   res.json({ data: rows });
 });
 
+/**
+ * For "Choose locations" in New schedule and One-off trip: every route's stops in order (terminal, minutes from the
+ * first stop). The form uses it to fill in known travel times and to say when the chosen stops are a saved route.
+ */
+router.get('/route-builder', async (_req, res) => {
+  const { rows } = await query(
+    `SELECT r.id, r.name, r.is_active,
+            (SELECT json_agg(json_build_object('terminalId', rs.terminal_id, 'minutes', rs.minutes_from_origin) ORDER BY rs.stop_order)
+             FROM route_stops rs WHERE rs.route_id = r.id) AS stops
+     FROM routes r ORDER BY r.is_active DESC, r.id`,
+  );
+  res.json({ data: rows.map((r) => ({ ...r, stops: r.stops ?? [] })) });
+});
+
 router.get('/routes/:id', validate({ params: idParam }), async (req, res) => {
   const route = await getRouteWithStops(req.valid.params.id);
   if (!route) throw AppError.notFound('Route not found');

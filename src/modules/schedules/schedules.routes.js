@@ -8,6 +8,7 @@ import { buildUpdate } from '../../utils/sql.js';
 import { audit } from '../../utils/audit.js';
 import { busClass, idParam, intId, isoDate, time } from '../../utils/schemas.js';
 import { busConfirmReady } from '../trips/busConfirm.js';
+import { customRouteSchema, findOrCreateRoute } from '../routes/customRoute.js';
 
 const router = Router();
 const admin = [requireAuth, requireRole(...ADMIN_ROLES)];
@@ -19,9 +20,8 @@ const daysOfWeek = z
   .max(7)
   .transform((d) => [...new Set(d)].sort());
 
-const scheduleSchema = z
+const scheduleFields = z
   .object({
-    routeId: intId,
     departureTime: time,
     busClass,
     defaultBusId: intId.nullable().optional(),
@@ -31,6 +31,16 @@ const scheduleSchema = z
     isActive: z.boolean().optional(),
   })
   .strict();
+
+/** A new schedule is on a saved route (routeId) or on one built from chosen locations (customRoute). */
+const scheduleSchema = scheduleFields
+  .extend({ routeId: intId.optional(), customRoute: customRouteSchema.optional() })
+  .strict()
+  .superRefine((s, ctx) => {
+    if (Boolean(s.routeId) === Boolean(s.customRoute)) {
+      ctx.addIssue({ code: 'custom', path: ['routeId'], message: 'Choose a saved route, or choose the locations' });
+    }
+  });
 
 const COLS = {
   departureTime: 'departure_time',
@@ -55,21 +65,31 @@ router.get('/', ...staff, validate({ query: z.object({ routeId: intId.optional()
 
 router.post('/', ...admin, validate({ body: scheduleSchema }), async (req, res) => {
   const s = req.valid.body;
-  const schedule = await one(
-    `INSERT INTO schedules (route_id, departure_time, bus_class, default_bus_id, days_of_week,
-                            effective_from, effective_to, is_active)
-     VALUES ($1, $2, $3, $4, COALESCE($5::smallint[], '{1,2,3,4,5,6,7}'), COALESCE($6::date, CURRENT_DATE), $7, COALESCE($8, TRUE))
-     RETURNING *`,
-    [s.routeId, s.departureTime, s.busClass, s.defaultBusId ?? null, s.daysOfWeek ?? null,
-      s.effectiveFrom ?? null, s.effectiveTo ?? null, s.isActive ?? null],
-  );
-  res.status(201).json({ data: schedule });
+  // A route built from chosen locations is found or created with the schedule: both or neither.
+  const { schedule, route } = await withTransaction(async (client) => {
+    const built = s.customRoute ? await findOrCreateRoute(client, s.customRoute) : null;
+    const row = await one(
+      `INSERT INTO schedules (route_id, departure_time, bus_class, default_bus_id, days_of_week,
+                              effective_from, effective_to, is_active)
+       VALUES ($1, $2, $3, $4, COALESCE($5::smallint[], '{1,2,3,4,5,6,7}'), COALESCE($6::date, CURRENT_DATE), $7, COALESCE($8, TRUE))
+       RETURNING *`,
+      [built?.id ?? s.routeId, s.departureTime, s.busClass, s.defaultBusId ?? null, s.daysOfWeek ?? null,
+        s.effectiveFrom ?? null, s.effectiveTo ?? null, s.isActive ?? null],
+      client,
+    );
+    return { schedule: row, route: built };
+  });
+  if (route?.created) {
+    await audit({ req, action: 'route.create', entityType: 'route', entityId: route.id, newData: { code: route.code, name: route.name, ...s.customRoute, builtFor: 'schedule' } });
+  }
+  // `route` (only when locations were chosen): { id, code, name, created, hasFares }.
+  res.status(201).json({ data: schedule, route });
 });
 
 router.patch(
   '/:id',
   ...admin,
-  validate({ params: idParam, body: scheduleSchema.omit({ routeId: true }).partial() }),
+  validate({ params: idParam, body: scheduleFields.partial() }),
   async (req, res) => {
     const { setSql, values } = buildUpdate(req.valid.body, COLS, 2);
     const s = await one(`UPDATE schedules SET ${setSql} WHERE id = $1 RETURNING *`, [req.valid.params.id, ...values]);

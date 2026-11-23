@@ -520,7 +520,8 @@ Access: **public**, **C** = any signed-in user, **owner** = the booking's custom
 | GET/POST/PATCH | `/fleet/layouts` · `/fleet/buses` · `/fleet/drivers` | S read · A write | Fleet |
 | GET | `/fares?routeId=` | public | Fare table |
 | POST/PATCH | `/fares[/:id]` | A | Manage fares |
-| GET/POST/PATCH | `/schedules[/:id]` | S read · A write | Timetables |
+| GET/POST/PATCH | `/schedules[/:id]` | S read · A write | Timetables. A new schedule (and `POST /trips`) takes a saved `routeId` **or** `customRoute: { terminalIds, legMinutes }` ("Choose locations": from, via stops, to, minutes per leg). A saved route with the same terminals in the same order is reused; otherwise one is created (code `NK-ISB-DIK`, `-2`…, name "Islamabad → DI Khan (via Mianwali)") in the same transaction (`modules/routes/customRoute.js`). The answer then has `route: { id, code, name, created, hasFares }`. A new route has no fares: set them on the Fares page before it can be booked |
+| GET | `/admin/route-builder` | A | Every route's stops in order (terminal, minutes), for that form: known travel times and "this is a saved route" |
 | POST | `/schedules/:id/generate-trips` | A | Create dated trips (≤ 92 days, safe to re-run; `alreadyThere` counts days that had the trip). Every trip is made with the default bus as its **planned** bus (`busToConfirm: true`), so no day is skipped. Before migration `2026-11-22-bus-confirm.sql`: days when the default bus is on an overlapping trip are skipped and returned in `skipped` |
 | GET | `/trips/search?fromCityId&toCityId&date&passengers&busClass` | public | Search trips |
 | GET | `/trips/:id` · `/trips/:id/seats` | public | Trip details, seat map (no passenger data) |
