@@ -352,15 +352,15 @@ const RAN = ['departed', 'arrived'];
  *   - did not run (not marked departed or arrived);
  *   - does not connect: it ended in a different city from where the next leg starts (a trip is missing);
  *   - arrived more than MAX_LEG_GAP_HOURS before the next leg left.
- * Returns the trip ids in the order travelled.
+ * Returns the trips newest first: [{ id, startsAtOrigin, fromCityId, toCityId }].
  */
-export async function chainEndingWith(client, lastTripId) {
+async function walkBack(client, lastTripId) {
   // Compared inside the database: a JavaScript date would round the departure time to milliseconds.
   // Rows come newest first; lag() is the next (later) leg of each row. A trip whose bus was only planned
   // (busConfirm.js) never ran on this bus, so it is skipped like a cancelled one.
   const confirmed = await confirmedSql('t', client);
   const { rows } = await query(
-    `SELECT t.id, t.status::text AS status, ot.is_origin AS starts_at_origin, dt.city_id AS to_city_id,
+    `SELECT t.id, t.status::text AS status, ot.is_origin AS starts_at_origin, ot.city_id AS from_city_id, dt.city_id AS to_city_id,
             EXISTS (SELECT 1 FROM round_trip_legs l WHERE l.trip_id = t.id) AS in_report,
             lag(ot.city_id) OVER w AS next_from_city_id,
             EXTRACT(EPOCH FROM (lag(t.departure_at) OVER w - COALESCE(t.arrival_at, t.departure_at))) / 3600 AS gap_hours
@@ -376,7 +376,7 @@ export async function chainEndingWith(client, lastTripId) {
     [lastTripId],
     client,
   );
-  const chain = [];
+  const walked = [];
   for (const [i, t] of rows.entries()) {
     if (t.inReport) break;
     if (!RAN.includes(t.status)) break; // a trip that never ran is in no automatic report (the last one included)
@@ -384,15 +384,39 @@ export async function chainEndingWith(client, lastTripId) {
       if (t.toCityId !== t.nextFromCityId) break;
       if (Number(t.gapHours) > MAX_LEG_GAP_HOURS) break;
     }
-    chain.unshift(t.id);
+    walked.push(t);
     if (t.startsAtOrigin) break;
   }
-  return chain;
+  return walked;
+}
+
+/** The round trip that ends with a trip arriving at an origin terminal: the whole walk, in the order travelled. */
+export async function chainEndingWith(client, lastTripId) {
+  return (await walkBack(client, lastTripId)).map((t) => t.id).reverse();
+}
+
+/**
+ * The out-and-back that ends with a trip arriving AWAY from an origin terminal (Islamabad → DI Khan, then
+ * DI Khan → Islamabad): the bus is back in the city it started from. From the same walk:
+ *   - it reached a trip that left an origin terminal: nothing ([]). The bus is on a Lahore / Multan round trip,
+ *     which closes when it is back at an origin (so Lahore → DI Khan → Islamabad → DI Khan → Lahore stays one report);
+ *   - otherwise, the most recent earlier trip that left the city the bus has now arrived in starts the loop;
+ *   - no such trip (a one-way trip, or the bus is still away from where it started): nothing.
+ * Returns the trip ids in the order travelled.
+ */
+export async function loopEndingWith(client, lastTripId) {
+  const walked = await walkBack(client, lastTripId);
+  if (!walked.length || walked.some((t) => t.startsAtOrigin)) return [];
+  const backIn = walked[0].toCityId;
+  const start = walked.findIndex((t, i) => i > 0 && t.fromCityId === backIn);
+  return start < 0 ? [] : walked.slice(0, start + 1).map((t) => t.id).reverse();
 }
 
 /**
  * Makes the bus's round trip report if `tripId` closes one and it has none yet. The only moment a report is made
- * automatically: a trip ending at an origin terminal is marked Arrived (and the "scan" button, for the same trips).
+ * automatically is a trip being marked Arrived (and the "scan" button, for the same trips):
+ *   - at an origin terminal (Lahore, Multan): the bus's round trip (chainEndingWith);
+ *   - anywhere else: only if the bus is back in the city it started from (loopEndingWith).
  * Boarding, Departed and generating a voucher never make one: an earlier "safety net" there swept up one older
  * never-run trip per click.
  * Runs inside a savepoint: a problem here never stops the status change; it is returned instead.
@@ -407,11 +431,11 @@ export async function autoCreateReport(client, { tripId, userId = null }) {
       [tripId],
       client,
     );
-    if (!t || t.inReport || !t.endsAtOrigin) {
+    if (!t || t.inReport) {
       await client.query('RELEASE SAVEPOINT auto_report');
       return null;
     }
-    const tripIds = await chainEndingWith(client, tripId);
+    const tripIds = t.endsAtOrigin ? await chainEndingWith(client, tripId) : await loopEndingWith(client, tripId);
     const made = tripIds.length ? await createFromTripIds(client, { userId, tripIds, autoCreated: true }) : null;
     await client.query('RELEASE SAVEPOINT auto_report');
     return made && { roundTripId: made.id, tripIds };
@@ -422,15 +446,14 @@ export async function autoCreateReport(client, { tripId, userId = null }) {
 }
 
 /**
- * Finds buses that have come back to an origin terminal without a report (trips ending at an origin, arrived,
- * not in any report, last N days) and makes their reports. Button on the reports page: the catch-up for an
- * arrival whose report was not made.
+ * Finds buses that have finished a round trip without a report (arrived trips in no report, last N days: back at an
+ * origin terminal, or back in the city they started from) and makes their reports. Button on the reports page:
+ * the catch-up for an arrival whose report was not made. Oldest first, so each loop is closed by its own arrival.
  */
 export async function scanCompletedRoundTrips(client, { userId = null, days = 30 } = {}) {
   const { rows } = await query(
     `SELECT t.id FROM trips t
-     JOIN routes r ON r.id = t.route_id JOIN terminals dt ON dt.id = r.destination_terminal_id
-     WHERE t.status = 'arrived' AND dt.is_origin
+     WHERE t.status = 'arrived'
        AND t.departure_at > now() - make_interval(days => $1)
        AND NOT EXISTS (SELECT 1 FROM round_trip_legs l WHERE l.trip_id = t.id)
      ORDER BY t.departure_at`,

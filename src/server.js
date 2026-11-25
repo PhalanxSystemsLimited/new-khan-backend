@@ -3,6 +3,7 @@ import { pool } from './config/db.js';
 import { logger } from './utils/logger.js';
 import { createApp } from './app.js';
 import { startExpiryJob } from './jobs/expireBookings.js';
+import { isConnectionError } from './utils/dbErrors.js';
 
 const app = createApp();
 
@@ -34,6 +35,12 @@ process.on('SIGTERM', () => shutdown('SIGTERM'));
 process.on('SIGINT', () => shutdown('SIGINT'));
 process.on('unhandledRejection', (err) => logger.error({ err }, 'Unhandled promise rejection'));
 process.on('uncaughtException', (err) => {
+  // A lost database connection is temporary and the pool replaces it: never a reason to stop serving everyone.
+  // (Transactions handle it themselves in config/db.js; this is the safety net for any other path.)
+  if (isConnectionError(err)) {
+    logger.error({ err }, 'Database connection error outside a request (server keeps running)');
+    return;
+  }
   logger.fatal({ err }, 'Uncaught exception');
   shutdown('uncaughtException');
 });

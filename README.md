@@ -121,7 +121,7 @@ refuses to start and prints the variable's **name** (never its value).
 | `SUPABASE_ANON_KEY` | ✔ | – | Same page |
 | `SUPABASE_SERVICE_ROLE_KEY` | ✔ | – | Same page. **Server only**, never put in the frontend. |
 | `DATABASE_URL` | ✔ | – | Supabase → **Connect** → **Session pooler** string (port 5432, IPv4). Don't use the direct `db.*` host (IPv6 only). |
-| `DB_POOL_MAX` | | `10` | Max DB connections |
+| `DB_POOL_MAX` | | `10` (`3` on Vercel) | Connections this process may hold. Supabase's pooler allows about **15 in all** (session mode), shared by every copy of the API on the same database: `10` for the one server on Hostinger, `3` on Vercel, `3` on a developer's PC. Above the limit every request fails until connections free up |
 | `DB_SSL` | | `true` | TLS to the DB |
 | `DB_SSL_CA_PATH` | | – | e.g. `certs/supabase-ca.crt`. When set, the DB certificate is fully verified (recommended). |
 | `AUTH_REDIRECT_URL` | | – | Where Supabase sends users from password-reset / confirmation emails |
@@ -389,9 +389,15 @@ Code: `src/modules/roundtrips/` (`report.calc.js` holds every formula; `roundtri
   stops at an earlier trip that is already in a report, more than 12 legs back, **did not run** (not departed/arrived),
   **does not connect** (it ended in a different city from where the next leg starts) or arrived **more than 36 hours**
   (`MAX_LEG_GAP_HOURS`) before the next leg left. Cancelled trips are skipped.
-  That is the only moment a report is made automatically: marking the trip **Arrived** at a home base (or the *Scan*
-  button on the reports page, for arrivals whose report is missing). Boarding, Departed and generating a voucher never
-  make one, and a trip that never ran (not departed/arrived) is in no automatic report. Home bases are set per database
+  **Out-and-back away from a home base** (`loopEndingWith`): a bus marked Arrived somewhere else gets a report when it
+  is back in the city it started from (Islamabad → DI Khan, then DI Khan → Islamabad: report on arrival in Islamabad).
+  Same walk and checks; the loop starts at the most recent earlier trip that left the arrival city. If the walk reaches
+  a trip that left a home base, nothing is made there: that journey closes at the home base (Lahore → DI Khan →
+  Islamabad → DI Khan → Lahore is one report). A one-way trip makes none. A bus passing its start city twice gets one
+  report per loop.
+  The only moment a report is made automatically is marking a trip **Arrived** (or the *Scan* button on the reports
+  page, for arrivals whose report is missing). Boarding, Departed and generating a voucher never make one, and a trip
+  that never ran (not departed/arrived) is in no automatic report. Home bases are set per database
   (`terminals.is_origin`, tick box on the terminal): a database seeded after `schema.sql` ran has none until they are ticked.
 - **Report checks** (`GET /admin/round-trips/:id/checks`): plain-words warnings shown on a draft whose legs do not look like
   one journey (a leg that never ran or was cancelled, legs that do not connect, a gap over 36 hours, legs spread over more
@@ -588,6 +594,9 @@ Quote the `requestId` (also in the `X-Request-Id` response header) when searchin
   booking 20 / hour; PNR/phone lookup 20 / 15 min; payment 30 / 15 min; search 60 / min.
 - **Payments:** idempotency keys, signed webhooks with constant-time comparison, amounts checked against the booking,
   return URLs verified with Safepay's API, duplicate/late payments refunded.
+- **Database connections** (`config/db.js`, `utils/dbErrors.js`): a connection lost during a transaction fails only that
+  request (503 `RETRY`), the broken connection is thrown away, and the server keeps running; an idle transaction is ended
+  after 60 seconds so its locks never linger. Tested by killing a connection mid-transaction through both poolers (5432, 6543).
 - **Hardening:** Helmet, CORS allowlist, 50 kb JSON limit, JSON-only bodies, parameterised SQL only, secrets removed from logs,
   no stack traces in production, request IDs, server timeouts.
 - **Audit log** of admin actions (`audit_logs`).
@@ -616,6 +625,8 @@ Quote the `requestId` (also in the `X-Request-Id` response header) when searchin
 | Server exits with "Invalid environment configuration" | A variable in `.env` is missing or invalid; the message names it. |
 | `CORS_NOT_ALLOWED` in the browser | Add the frontend URL to `CORS_ORIGINS` (localhost is auto-allowed only when `NODE_ENV` isn't `production`). |
 | DB connection errors / timeouts | Use the **Session pooler** URL (IPv4), not the direct host. Check the password and `DB_SSL_CA_PATH`. |
+| `RETRY` (503) "The system is busy, please try again in a moment" | The database connection failed for that request (network drop, pooler full, database restarting). The server keeps running and the next request gets a fresh connection. If it keeps happening, the log shows the cause: `max clients reached` = too many connections in all, lower `DB_POOL_MAX` or stop a second copy of the API pointed at the same database (a developer's PC on the live database counts). |
+| A sale or booking "hangs" on one bus | Should no longer happen: a transaction that sits idle for 60 seconds is ended by the database and its locks are released (`config/db.js`). Before this, a transaction whose connection was lost stayed open for minutes holding the trip's row lock. |
 | Paid booking shows "Held" for a minute | Webhook couldn't reach the server (e.g. localhost). The reconcile step confirms it on next load / within a minute. |
 | Safepay "PAYER_AUTH_ENROLLMENT failed" | Not a Safepay sandbox test card; see §7.4. |
 | `TOO_MANY_PENDING` | Customer has 3 unpaid bookings; pay or cancel one. |

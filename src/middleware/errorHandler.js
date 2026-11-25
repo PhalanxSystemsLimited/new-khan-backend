@@ -1,6 +1,7 @@
 import { ZodError } from 'zod';
 import { AppError } from '../utils/AppError.js';
 import { env } from '../config/env.js';
+import { isConnectionError } from '../utils/dbErrors.js';
 
 // Friendly messages for known unique constraints.
 const UNIQUE_MESSAGES = {
@@ -71,6 +72,11 @@ export function errorHandler(err, req, res, _next) {
     appErr = new AppError(413, 'Request body too large', 'PAYLOAD_TOO_LARGE');
   } else if (err?.message === 'CORS_NOT_ALLOWED') {
     appErr = AppError.forbidden('Origin not allowed');
+  } else if (isConnectionError(err)) {
+    // The database connection failed (network drop, pooler full, database restarting): temporary, not a bug in the
+    // request. Answer "try again" instead of "Internal server error"; it is still logged in full below.
+    appErr = new AppError(503, 'The system is busy, please try again in a moment.', 'RETRY');
+    res.set('Retry-After', '3');
   } else if (typeof err?.code === 'string' && /^[0-9A-Z]{5}$/.test(err.code)) {
     appErr = fromPg(err);
   }

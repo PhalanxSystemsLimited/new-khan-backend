@@ -29,11 +29,23 @@ export const pool = new pg.Pool({
   connectionTimeoutMillis: 10_000,
   statement_timeout: 15_000,
   query_timeout: 20_000,
+  // TCP keep-alive: a connection the network has silently dropped is noticed, not found dead on the next request.
+  keepAlive: true,
+  keepAliveInitialDelayMillis: 10_000,
   ssl: sslConfig(),
   application_name: 'new-khan-backend',
 });
 
 pool.on('error', (err) => logger.error({ err }, 'Unexpected idle DB client error'));
+
+/**
+ * A transaction that does nothing for this long is ended by the database itself, and its locks are released.
+ * Without it, a transaction whose connection was lost half-way stayed open on the database (through the pooler)
+ * for many minutes holding its row locks: a locked trip row stops every sale on that bus. No transaction in this
+ * API waits anywhere near this long between two statements. Set per transaction (SET LOCAL), so it works the same
+ * through Supabase's session pooler (5432) and transaction pooler (6543).
+ */
+const IDLE_IN_TRANSACTION_MS = 60_000;
 
 /** Run a parameterised query. Rows are returned with camelCase keys. */
 export async function query(text, params = [], client = pool) {
@@ -51,19 +63,35 @@ export async function one(text, params = [], client = pool) {
  */
 export async function withTransaction(fn, { isolation = 'READ COMMITTED' } = {}) {
   const client = await pool.connect();
+  // While a connection is checked out the pool does not listen for its errors. A connection that drops between
+  // two statements then raised an "error" event nobody handled, which Node treats as fatal: the whole API went
+  // down for one lost connection. Listen here instead: the statement that follows fails and only this request does.
+  let broken = null;
+  const onError = (err) => {
+    broken = err;
+    logger.warn({ err }, 'Database connection lost during a transaction');
+  };
+  client.on('error', onError);
   try {
-    await client.query(`BEGIN ISOLATION LEVEL ${isolation}`);
+    // One round trip: the two statements go in a single message.
+    await client.query(`BEGIN ISOLATION LEVEL ${isolation}; SET LOCAL idle_in_transaction_session_timeout = ${IDLE_IN_TRANSACTION_MS}`);
     const result = await fn(client);
     await client.query('COMMIT');
     return result;
   } catch (err) {
-    try {
-      await client.query('ROLLBACK');
-    } catch (rollbackErr) {
-      logger.error({ err: rollbackErr }, 'Rollback failed');
+    if (!broken) {
+      try {
+        await client.query('ROLLBACK');
+      } catch (rollbackErr) {
+        // The connection's state is unknown now: it must not go back into the pool.
+        broken = rollbackErr;
+        logger.error({ err: rollbackErr }, 'Rollback failed');
+      }
     }
     throw err;
   } finally {
-    client.release();
+    client.removeListener('error', onError);
+    // A broken connection is closed and replaced, never handed to the next request.
+    client.release(broken ?? undefined);
   }
 }

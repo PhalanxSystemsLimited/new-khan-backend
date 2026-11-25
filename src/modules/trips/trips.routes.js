@@ -530,8 +530,9 @@ router.patch(
       if (b.status === 'arrived') {
         await client.query(`UPDATE bookings SET status = 'completed' WHERE trip_id = $1 AND status = 'confirmed'`, [id]);
       }
-      // A round trip report is made automatically at one moment only: the bus is marked Arrived at an origin
-      // terminal (Lahore, Multan). Boarding and Departed never make one. Never blocks the change.
+      // A round trip report is made automatically at one moment only: the bus is marked Arrived, either at an origin
+      // terminal (Lahore, Multan) or back in the city it started from (Islamabad → DI Khan → Islamabad).
+      // Boarding and Departed never make one. Never blocks the change.
       let autoReport = null;
       if (b.status === 'arrived' && t.status !== 'arrived') autoReport = await autoCreateReport(client, { tripId: id, userId: req.user.id });
       return { trip, affectedBookings, autoReport };

@@ -20,7 +20,10 @@ const schema = z.object({
   SUPABASE_SERVICE_ROLE_KEY: z.string().min(20),
 
   DATABASE_URL: z.string().regex(/^postgres(ql)?:\/\//, 'must be a postgres:// connection string'),
-  DB_POOL_MAX: z.coerce.number().int().min(1).max(50).default(10),
+  // Connections this process may hold. Supabase's pooler allows about 15 in all (session mode), shared by every
+  // copy of the API that uses the same database: 10 for the one long-running server on Hostinger, 3 on Vercel
+  // (many small copies run at once), 3 for a developer's PC. Unset: 3 on Vercel, 10 elsewhere.
+  DB_POOL_MAX: z.coerce.number().int().min(1).max(50).default(process.env.VERCEL ? 3 : 10),
   DB_SSL_CA_PATH: z.string().optional().default(''),
   // The same certificate as text (PEM), for hosts without a file system you control (Vercel). Wins over the path.
   DB_SSL_CA: z.string().optional().default(''),
