@@ -278,39 +278,90 @@ router.get('/reports/summary', validate({ query: rangeSchema }), async (req, res
 });
 
 /**
- * Cash report: per day (Pakistan time) and per staff member, the cash they took for counter sales and the cash
- * they paid out for counter refunds. Net is what that person should hand in for the day.
+ * Cash report: per day (Pakistan time) and per staff member, every kind of cash that person took and paid back:
+ *   - tickets: cash for counter sales and road passengers (payments), less cash refunds they paid out. A refund counts
+ *     for whoever recorded it as paid: counter refunds (the clerk), and refunds of CASH tickets marked paid later
+ *     (a cancelled trip's cash tickets), which used to be missing because they are not "counter" refunds;
+ *   - extra load: the load slips they wrote (counter and conductor), cancelled slips left out;
+ *   - cargo: parcels paid at booking (cancelled ones left out) and receiver-pays parcels they collected for at hand-over.
+ * Net is everything that person should be able to account for that day.
  */
 router.get('/reports/cash', validate({ query: rangeSchema }), async (req, res) => {
   const { from, to } = req.valid.query;
-  const { rows } = await query(
-    `WITH cash_in AS (
-       SELECT (paid_at AT TIME ZONE 'Asia/Karachi')::date AS day, received_by AS staff_id,
-              count(*) AS sales, sum(amount) AS taken
+  const day = (col) => `(${col} AT TIME ZONE 'Asia/Karachi')::date`;
+  const between = (col) => `${day(col)} BETWEEN $1 AND $2`;
+  // A table from a migration that has not been run yet: that kind of cash is simply left out.
+  const optional = (sql) => query(sql, [from, to]).catch((err) => {
+    if (['42P01', '42703'].includes(err.code)) return { rows: [] };
+    throw err;
+  });
+  const [tickets, refunds, load, cargoPaid, cargoCollected] = await Promise.all([
+    query(
+      `SELECT ${day('paid_at')} AS day, received_by AS staff_id, count(*)::int AS n, sum(amount) AS amount
        FROM payments
-       WHERE method = 'cash' AND paid_at IS NOT NULL AND status IN ('succeeded', 'refunded', 'partially_refunded')
-         AND (paid_at AT TIME ZONE 'Asia/Karachi')::date BETWEEN $1 AND $2
-       GROUP BY 1, 2
-     ), cash_out AS (
-       SELECT (processed_at AT TIME ZONE 'Asia/Karachi')::date AS day, processed_by AS staff_id,
-              count(*) AS refunds, sum(amount) AS paid_out
-       FROM refunds
-       WHERE channel = 'counter' AND status = 'processed'
-         AND (processed_at AT TIME ZONE 'Asia/Karachi')::date BETWEEN $1 AND $2
-       GROUP BY 1, 2
-     )
-     SELECT COALESCE(i.day, o.day) AS day, COALESCE(i.staff_id, o.staff_id) AS staff_id,
-            u.full_name AS staff_name, u.email AS staff_email, u.role AS staff_role,
-            COALESCE(i.sales, 0)::int AS sales, COALESCE(i.taken, 0) AS taken,
-            COALESCE(o.refunds, 0)::int AS refunds, COALESCE(o.paid_out, 0) AS paid_out,
-            COALESCE(i.taken, 0) - COALESCE(o.paid_out, 0) AS net
-     FROM cash_in i
-     FULL JOIN cash_out o ON o.day = i.day AND o.staff_id IS NOT DISTINCT FROM i.staff_id
-     LEFT JOIN users u ON u.id = COALESCE(i.staff_id, o.staff_id)
-     ORDER BY 1 DESC, u.full_name NULLS LAST`,
-    [from, to],
-  );
-  res.json({ data: rows });
+       WHERE method = 'cash' AND paid_at IS NOT NULL AND status IN ('succeeded', 'refunded', 'partially_refunded') AND ${between('paid_at')}
+       GROUP BY 1, 2`,
+      [from, to],
+    ),
+    query(
+      `SELECT ${day('rf.processed_at')} AS day, rf.processed_by AS staff_id, count(*)::int AS n, sum(rf.amount) AS amount
+       FROM refunds rf JOIN payments p ON p.id = rf.payment_id
+       WHERE rf.status = 'processed' AND (rf.channel = 'counter' OR p.method = 'cash') AND ${between('rf.processed_at')}
+       GROUP BY 1, 2`,
+      [from, to],
+    ),
+    optional(
+      `SELECT ${day('created_at')} AS day, created_by AS staff_id, count(*)::int AS n, sum(amount) AS amount
+       FROM load_slips WHERE status = 'active' AND ${between('created_at')} GROUP BY 1, 2`,
+    ),
+    optional(
+      `SELECT ${day('paid_at')} AS day, booked_by AS staff_id, count(*)::int AS n, sum(charge) AS amount
+       FROM parcels WHERE payment = 'paid' AND status <> 'cancelled' AND ${between('paid_at')} GROUP BY 1, 2`,
+    ),
+    optional(
+      `SELECT ${day('paid_at')} AS day, delivered_by AS staff_id, count(*)::int AS n, sum(charge) AS amount
+       FROM parcels WHERE payment = 'to_pay' AND paid_at IS NOT NULL AND status <> 'cancelled' AND ${between('paid_at')} GROUP BY 1, 2`,
+    ),
+  ]);
+
+  const byKey = new Map();
+  const rowFor = (r) => {
+    const d = typeof r.day === 'string' ? r.day.slice(0, 10) : new Date(r.day).toISOString().slice(0, 10);
+    const key = `${d}|${r.staffId ?? ''}`;
+    if (!byKey.has(key)) {
+      byKey.set(key, { day: d, staffId: r.staffId ?? null, sales: 0, taken: 0, refunds: 0, paidOut: 0, loadSlips: 0, loadCash: 0, parcels: 0, cargoCash: 0 });
+    }
+    return byKey.get(key);
+  };
+  for (const r of tickets.rows) Object.assign(rowFor(r), { sales: r.n, taken: Number(r.amount) });
+  for (const r of refunds.rows) Object.assign(rowFor(r), { refunds: r.n, paidOut: Number(r.amount) });
+  for (const r of load.rows) Object.assign(rowFor(r), { loadSlips: r.n, loadCash: Number(r.amount) });
+  for (const r of [...cargoPaid.rows, ...cargoCollected.rows]) {
+    const x = rowFor(r);
+    x.parcels += r.n;
+    x.cargoCash += Number(r.amount);
+  }
+
+  const ids = [...new Set([...byKey.values()].map((r) => r.staffId).filter(Boolean))];
+  const { rows: people } = ids.length
+    ? await query(`SELECT id, full_name, email, role FROM users WHERE id = ANY ($1::uuid[])`, [ids])
+    : { rows: [] };
+  const who = new Map(people.map((u) => [u.id, u]));
+  const data = [...byKey.values()]
+    .map((r) => {
+      const u = who.get(r.staffId);
+      return {
+        ...r,
+        staffName: u?.fullName ?? null,
+        staffEmail: u?.email ?? null,
+        staffRole: u?.role ?? null,
+        // Tickets only, as before; and everything together.
+        ticketNet: r.taken - r.paidOut,
+        net: r.taken - r.paidOut + r.loadCash + r.cargoCash,
+      };
+    })
+    .sort((a, b) => (a.day < b.day ? 1 : a.day > b.day ? -1 : String(a.staffName ?? '~').localeCompare(String(b.staffName ?? '~'))));
+  res.json({ data });
 });
 
 // ======================= Activity log =======================

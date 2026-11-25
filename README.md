@@ -284,7 +284,15 @@ migration are confirmed; until it runs, every trip counts as confirmed and every
 | `completed` | Trip finished (needed before a review) | Confirmed |
 
 Rules:
-- A customer may have at most **3 unpaid (`pending`) bookings** at a time.
+- A customer may have at most **3 unpaid (`pending`) bookings** at a time (counted with the account row locked, so requests sent
+  at the same moment cannot slip past it together).
+- **Counter staff sell seats that board at their own terminal** (`NOT_YOUR_TERMINAL`, 403, otherwise): the cash is counted on
+  that terminal's voucher. Managers and admins sell from anywhere; customers book online from anywhere.
+- **Promo codes** (online only): the admin sets the discount, up to 100%. A use is taken when the booking is made (unpaid holds
+  count, under a lock on the code) and freed if the hold expires or is cancelled, so a limit of 1 means 1. A booking that comes
+  to Rs 0 is confirmed at once with no payment.
+- **Online payment methods**: only those with a real gateway are accepted (`METHOD_UNAVAILABLE`, 422, otherwise): the methods in
+  `SAFEPAY_METHODS` while Safepay is on, or any method once a relay of your own is set up (`PAYMENT_WEBHOOK_SECRET`).
 - **No double booking**: a unique index on `(trip_id, seat_id)` for active tickets. Two people can never hold the same seat.
 - No seat is reserved for women. A male and a female passenger from **different bookings** may not sit side by side
   (neighbouring seats on the same side of the aisle, e.g. 1–2 or 3–4; across the aisle is fine; on the full-width back row
@@ -308,7 +316,9 @@ Rules:
     checked the customer (`identity_check = 'manager'`), or, once SMS is on, a 6-digit code is sent to the booking's
     phone (`POST /bookings/:id/counter-code`). Other staff get `MANAGER_APPROVAL_REQUIRED` (403). Paid in cash → refunded in cash at once
     (`channel = 'counter'`, `processed`). Paid online → cancelled, refund goes to the super admin as above.
-  - `GET /admin/reports/cash`: cash taken and refunded per staff member per day.
+  - `GET /admin/reports/cash`: per staff member per day: ticket cash taken (`taken`) and cash refunds they paid out (`paidOut`:
+    counter refunds, and refunds of cash tickets marked paid later, e.g. a cancelled trip), extra load slips (`loadCash`),
+    cargo (`cargoCash`: parcels paid at booking, receiver-pays collected at hand-over); `ticketNet` and `net` (all together).
   - While SMS is off, in development the code is shown on the staff screen; in production only the manager route works.
 - Seat holds/releases are done by DB triggers when the booking status changes (`release_seats_on_booking_end`).
 

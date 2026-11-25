@@ -82,3 +82,11 @@ export const gateways = {
 export function gatewayFor(method) {
   return safepayEnabled && env.SAFEPAY_METHODS.includes(method) ? 'safepay' : method;
 }
+
+/**
+ * Whether a customer can really pay with this method now: it goes through Safepay, or a relay service of your own
+ * is set up (PAYMENT_WEBHOOK_SECRET). Otherwise there is only the stub checkout above, which takes nobody's money.
+ */
+export function methodAvailable(method) {
+  return gatewayFor(method) === 'safepay' || Boolean(env.PAYMENT_WEBHOOK_SECRET);
+}

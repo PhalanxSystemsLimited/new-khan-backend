@@ -10,7 +10,7 @@ import { audit } from '../../utils/audit.js';
 import { logger } from '../../utils/logger.js';
 import { money, uuid } from '../../utils/schemas.js';
 import { assertCanAccess, confirmBookingInTx, getBookingDetail } from '../bookings/bookings.service.js';
-import { gatewayFor, gateways, ONLINE_METHODS } from './gateways.js';
+import { gatewayFor, gateways, methodAvailable, ONLINE_METHODS } from './gateways.js';
 import { sendBookingConfirmationSms } from '../sms/sms.service.js';
 import { PAID_STATE, fetchTracker, frontendUrl, isValidTracker, safepayEnabled } from './safepay.js';
 
@@ -48,6 +48,11 @@ router.post(
     // Scope the key per user and hash it to a fixed 64-char value.
     const key = crypto.createHash('sha256').update(`${req.user.id}:${keyCheck.data}`).digest('hex');
     const { bookingId, method, lang: uiLang = 'en' } = req.valid.body;
+    // Only methods with a real gateway behind them. Without this, "bank transfer" or "wallet" (and every method
+    // while Safepay is switched off) made a payment row with a placeholder checkout the customer could not use.
+    if (!methodAvailable(method)) {
+      throw new AppError(422, 'This payment method is not available yet. Please choose another one.', 'METHOD_UNAVAILABLE');
+    }
 
     const { payment, replay } = await withTransaction(async (client) => {
       const existing = await one(`SELECT * FROM payments WHERE idempotency_key = $1`, [key], client);

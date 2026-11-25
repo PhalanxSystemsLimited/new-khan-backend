@@ -80,7 +80,12 @@ async function applyPromo(client, { code, routeId, subtotal, userId }) {
   const invalid = () => AppError.unprocessable('Promo code is invalid or has expired');
   if (!promo) throw invalid();
   if (promo.routeId && promo.routeId !== routeId) throw AppError.unprocessable('Promo code is not valid for this route');
-  if (promo.usageLimit !== null && promo.timesUsed >= promo.usageLimit) throw invalid();
+  if (promo.usageLimit !== null) {
+    // Uses already paid for, plus bookings holding the code that are not paid yet (the code row is locked above,
+    // so two customers cannot both take the last use). A hold that expires or is cancelled frees its use again.
+    const held = await one(`SELECT count(*)::int AS n FROM bookings WHERE promo_code_id = $1 AND status = 'pending'`, [promo.id], client);
+    if (promo.timesUsed + held.n >= promo.usageLimit) throw invalid();
+  }
   if (subtotal < promo.minBookingAmount) {
     throw AppError.unprocessable(`Promo code requires a minimum booking of ${promo.minBookingAmount}`);
   }
@@ -116,6 +121,9 @@ export async function createBooking(user, input) {
     await client.query(`SELECT expire_stale_bookings()`);
 
     if (!staff) {
+      // One booking at a time per customer: the account row is locked first, so several requests sent at the same
+      // moment are counted one after another and cannot all slip under the limit together.
+      await client.query(`SELECT id FROM users WHERE id = $1 FOR UPDATE`, [user.id]);
       const pending = await one(
         `SELECT count(*)::int AS n FROM bookings WHERE user_id = $1 AND status = 'pending'`,
         [user.id],
@@ -170,12 +178,23 @@ export async function createBooking(user, input) {
       throw AppError.unprocessable('Booking is closed for this trip');
     }
     const stop = await one(
-      `SELECT rs.minutes_from_origin, c.name AS city FROM route_stops rs JOIN terminals tm ON tm.id = rs.terminal_id
+      `SELECT rs.minutes_from_origin, rs.terminal_id, c.name AS city FROM route_stops rs JOIN terminals tm ON tm.id = rs.terminal_id
        JOIN cities c ON c.id = tm.city_id WHERE rs.id = $1 AND rs.route_id = $2`,
       [input.boardingStopId, trip.routeId],
       client,
     );
     if (!stop) throw AppError.badRequest('That boarding terminal is not on this trip.');
+    // Counter staff sell seats that board at their OWN terminal: the cash they take is counted on that terminal's
+    // voucher. (Their screens only offer those buses; this is the same rule on the server.) Managers and admins: anywhere.
+    if (user.role === 'agent' && stop.terminalId !== user.terminalId) {
+      throw new AppError(
+        403,
+        user.terminalId
+          ? `Counter staff sell tickets that board at their own terminal. This one boards at ${stop.city}: its counter, or a manager, sells it.`
+          : 'Your account has no terminal. Ask an admin to set one.',
+        'NOT_YOUR_TERMINAL',
+      );
+    }
     // When the bus is due at the boarding terminal, delays included.
     const dueAt = new Date(trip.departureAt).getTime() + (stop.minutesFromOrigin + (trip.delayMinutes ?? 0)) * 60_000;
     // Booking from a terminal closes when its voucher is generated (the trip row lock above keeps this exact).
@@ -260,6 +279,11 @@ export async function createBooking(user, input) {
         [booking.id, trip.id, p.seatId, p.name, p.gender, p.age ?? null, p.cnic ?? null, p.phone ?? null, fare.amount],
       );
     }
+
+    // A promo code that covers the whole fare (the admin decides the discount, 100% included): there is nothing to
+    // pay, so the booking is confirmed now. Without this it stayed "pending" with a Rs 0 total that no payment can
+    // settle (a payment must be above zero) until its hold ran out.
+    if (subtotal - discount <= 0) await confirmBookingInTx(client, booking.id);
 
     return getBookingDetail(booking.id, client);
   });
