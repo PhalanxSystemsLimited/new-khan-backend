@@ -30,6 +30,10 @@ const LIST_SELECT = `
          CASE WHEN bk.user_id IS DISTINCT FROM $1 THEN bk.contact_name END AS customer_name,
          EXISTS (SELECT 1 FROM payments p WHERE p.booking_id = bk.id
                    AND p.status IN ('succeeded', 'refunded', 'partially_refunded')) AS payment_received,
+         -- An online payment was started and is not settled yet: past its time the hold is kept up to 20 more minutes
+         -- (expire_stale_bookings), and the website says "checking payment" instead of "expired".
+         EXISTS (SELECT 1 FROM payments p WHERE p.booking_id = bk.id AND p.gateway = 'safepay'
+                   AND p.status IN ('initiated', 'pending') AND p.gateway_txn_id IS NOT NULL) AS payment_open,
          r.name AS route_name, t.departure_at,
          bt.name AS boarding_terminal, dt.name AS dropping_terminal,
          t.departure_at + make_interval(mins => bs.minutes_from_origin) AS boarding_at,
@@ -54,6 +58,21 @@ async function reconcileUnsettled(where, params) {
     params,
   );
   for (const r of rows) await reconcileSafepayBooking(r.id);
+}
+
+/**
+ * Before showing bookings: holds whose time is up are expired now, which also releases their seats (the database
+ * trigger on the status change does that). A long-running server does this every minute by itself; a serverless
+ * host (Vercel) has no minute job, so without this a customer looking at My bookings saw a countdown stuck at
+ * 00:00 and the seat stayed held until somebody searched for that bus. Runs only when one of THESE bookings is due.
+ * Call it after reconcileUnsettled, so a payment that did go through is recorded first.
+ */
+async function expireDue(where, params) {
+  const due = await one(
+    `SELECT EXISTS (SELECT 1 FROM bookings bk WHERE ${where} AND bk.status = 'pending' AND bk.hold_expires_at <= now()) AS due`,
+    params,
+  );
+  if (due.due) await query(`SELECT expire_stale_bookings()`);
 }
 
 const passengerSchema = z
@@ -105,6 +124,7 @@ router.get('/me', requireAuth, validate({ query: pagination.strict() }), async (
   const q = req.valid.query;
   // Settle anything already paid on Safepay first, so the list never shows a paid booking as pending.
   await reconcileUnsettled(MINE, [req.user.id]);
+  await expireDue(MINE, [req.user.id]);
 
   const total = (await one(`SELECT count(*)::int AS n FROM bookings bk WHERE ${MINE}`, [req.user.id])).n;
   const { rows } = await query(
@@ -127,6 +147,7 @@ router.get(
   validate({ query: z.object({ phone }).strict() }),
   async (req, res) => {
     await reconcileUnsettled('bk.contact_phone = $1', [req.valid.query.phone]);
+    await expireDue('bk.contact_phone = $1', [req.valid.query.phone]);
     const { rows } = await query(
       `SELECT bk.status, bk.total_amount, bk.currency, bk.created_at, r.name AS route_name,
               bt.name AS boarding_terminal, dt.name AS dropping_terminal,
@@ -161,6 +182,7 @@ router.get(
     const found = await one(`SELECT id FROM bookings WHERE pnr = $1 AND contact_phone = $2`, [pnr, tel]);
     if (!found) throw AppError.notFound('No booking found for this PNR and phone number');
     await reconcileUnsettled('bk.id = $1', [found.id]);
+    await expireDue('bk.id = $1', [found.id]);
     const b = await getBookingDetail(found.id);
     const paid = await one(`SELECT 1 FROM payments WHERE booking_id = $1 AND status IN ('succeeded', 'refunded', 'partially_refunded') LIMIT 1`, [found.id]);
     res.json({
@@ -241,9 +263,14 @@ router.get('/:id', requireAuth, validate({ params: uuidParam }), async (req, res
   // An expired one that was paid gets its payment recorded and a refund queued (its seats were already released).
   if (booking.status === 'pending' || booking.status === 'expired') {
     await reconcileSafepayBooking(booking.id);
+    await expireDue('bk.id = $1', [booking.id]); // its time is up: expired now, seats released
     booking = await getBookingDetail(booking.id);
   }
-  res.json({ data: { ...booking, ticketQr: await ticketQrFor(booking) } });
+  // Still waiting on an online payment that was started (see payment_open in the list above).
+  const open = booking.status === 'pending'
+    ? await one(`SELECT EXISTS (SELECT 1 FROM payments p WHERE p.booking_id = bk.id AND p.gateway = 'safepay' AND p.status IN ('initiated', 'pending') AND p.gateway_txn_id IS NOT NULL) AS payment_open FROM bookings bk WHERE bk.id = $1`, [booking.id])
+    : null;
+  res.json({ data: { ...booking, paymentOpen: Boolean(open?.paymentOpen), ticketQr: await ticketQrFor(booking) } });
 });
 
 /**

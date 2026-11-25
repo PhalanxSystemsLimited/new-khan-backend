@@ -339,6 +339,14 @@ Run by [`src/jobs/expireBookings.js`](src/jobs/expireBookings.js) every minute, 
 expired reservation (last 7 days) and then calls `POST /bookings/expiry-seen`, which records it **on the account**
 (`bookings.expiry_seen_at`), so it isn't shown again on any device.
 
+**Expiry when the customer is looking.** `GET /bookings/me`, `GET /bookings/:id` and the public lookups expire that
+customer's holds whose time is up before answering (`expireDue` in `bookings.routes.js`), which releases the seats at once.
+On a serverless host there is no minute job, so without this the page showed a countdown stuck at 00:00 until someone searched
+for that bus. Each row carries `paymentOpen`: an online payment was started and is not settled, so the hold is kept up to 20
+more minutes (§6.3) and the website shows "Checking payment…" instead of "Expired". On the website the tag turns to Expired
+the moment the time is up, the pop-up below is shown once, and after it is closed the booking is left out of My bookings in
+every view. A booking whose money arrived late stays listed with its "payment under review" note.
+
 ### 6.5 Roles
 
 | Role | Can |
