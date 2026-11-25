@@ -379,8 +379,8 @@ export async function chainEndingWith(client, lastTripId) {
   const chain = [];
   for (const [i, t] of rows.entries()) {
     if (t.inReport) break;
+    if (!RAN.includes(t.status)) break; // a trip that never ran is in no automatic report (the last one included)
     if (i > 0) {
-      if (!RAN.includes(t.status)) break;
       if (t.toCityId !== t.nextFromCityId) break;
       if (Number(t.gapHours) > MAX_LEG_GAP_HOURS) break;
     }
@@ -391,11 +391,13 @@ export async function chainEndingWith(client, lastTripId) {
 }
 
 /**
- * Makes the bus's round trip report if `tripId` closes one and it has none yet. Used when a trip ending at an
- * origin terminal is marked Arrived, and (safety net) when the bus starts its next trip from an origin.
+ * Makes the bus's round trip report if `tripId` closes one and it has none yet. The only moment a report is made
+ * automatically: a trip ending at an origin terminal is marked Arrived (and the "scan" button, for the same trips).
+ * Boarding, Departed and generating a voucher never make one: an earlier "safety net" there swept up one older
+ * never-run trip per click.
  * Runs inside a savepoint: a problem here never stops the status change; it is returned instead.
  */
-export async function autoCreateReport(client, { tripId, userId = null, requireOriginEnd = true }) {
+export async function autoCreateReport(client, { tripId, userId = null }) {
   await client.query('SAVEPOINT auto_report');
   try {
     const t = await one(
@@ -405,7 +407,7 @@ export async function autoCreateReport(client, { tripId, userId = null, requireO
       [tripId],
       client,
     );
-    if (!t || t.inReport || (requireOriginEnd && !t.endsAtOrigin)) {
+    if (!t || t.inReport || !t.endsAtOrigin) {
       await client.query('RELEASE SAVEPOINT auto_report');
       return null;
     }
@@ -419,25 +421,10 @@ export async function autoCreateReport(client, { tripId, userId = null, requireO
   }
 }
 
-/** Safety net: the bus is leaving an origin again, so its previous trip (if not in a report) closes a round trip. */
-export async function closePreviousRoundTrip(client, { tripId, userId = null }) {
-  const confirmed = await confirmedSql('p', client);
-  const prev = await one(
-    `SELECT p.id FROM trips t
-     JOIN routes r ON r.id = t.route_id JOIN terminals ot ON ot.id = r.origin_terminal_id
-     JOIN trips p ON p.bus_id = t.bus_id AND p.departure_at < t.departure_at AND p.status <> 'cancelled' AND ${confirmed}
-     WHERE t.id = $1 AND ot.is_origin
-       AND NOT EXISTS (SELECT 1 FROM round_trip_legs l WHERE l.trip_id = p.id)
-     ORDER BY p.departure_at DESC LIMIT 1`,
-    [tripId],
-    client,
-  );
-  return prev ? autoCreateReport(client, { tripId: prev.id, userId, requireOriginEnd: false }) : null;
-}
-
 /**
  * Finds buses that have come back to an origin terminal without a report (trips ending at an origin, arrived,
- * not in any report, last N days) and makes their reports. Button on the reports page; also a safety net.
+ * not in any report, last N days) and makes their reports. Button on the reports page: the catch-up for an
+ * arrival whose report was not made.
  */
 export async function scanCompletedRoundTrips(client, { userId = null, days = 30 } = {}) {
   const { rows } = await query(

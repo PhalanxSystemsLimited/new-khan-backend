@@ -389,6 +389,10 @@ Code: `src/modules/roundtrips/` (`report.calc.js` holds every formula; `roundtri
   stops at an earlier trip that is already in a report, more than 12 legs back, **did not run** (not departed/arrived),
   **does not connect** (it ended in a different city from where the next leg starts) or arrived **more than 36 hours**
   (`MAX_LEG_GAP_HOURS`) before the next leg left. Cancelled trips are skipped.
+  That is the only moment a report is made automatically: marking the trip **Arrived** at a home base (or the *Scan*
+  button on the reports page, for arrivals whose report is missing). Boarding, Departed and generating a voucher never
+  make one, and a trip that never ran (not departed/arrived) is in no automatic report. Home bases are set per database
+  (`terminals.is_origin`, tick box on the terminal): a database seeded after `schema.sql` ran has none until they are ticked.
 - **Report checks** (`GET /admin/round-trips/:id/checks`): plain-words warnings shown on a draft whose legs do not look like
   one journey (a leg that never ran or was cancelled, legs that do not connect, a gap over 36 hours, legs spread over more
   than 3 days). Advice only; nothing is blocked. Missing terminal vouchers are listed per leg ("Leg 1 (6 Nov): Islamabad").

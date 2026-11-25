@@ -4,7 +4,7 @@ import { query, one, withTransaction } from '../../config/db.js';
 import { validate } from '../../middleware/validate.js';
 import { optionalAuth, requireAuth, requireRole, isStaff, ADMIN_ROLES, MANAGER_ROLES, STAFF_ROLES } from '../../middleware/auth.js';
 import { env } from '../../config/env.js';
-import { autoCreateReport, closePreviousRoundTrip } from '../roundtrips/roundtrips.sync.js';
+import { autoCreateReport } from '../roundtrips/roundtrips.sync.js';
 import { assertBusFree, createExtraDeparture, createTripWithReturn } from './trips.create.js';
 import { busConfirmReady, confirmedSql, CONFIRM_FIRST } from './busConfirm.js';
 import { customRouteSchema, findOrCreateRoute } from '../routes/customRoute.js';
@@ -530,11 +530,10 @@ router.patch(
       if (b.status === 'arrived') {
         await client.query(`UPDATE bookings SET status = 'completed' WHERE trip_id = $1 AND status = 'confirmed'`, [id]);
       }
-      // Round trip reports made automatically: arriving at an origin terminal (Lahore, Multan) closes the bus's
-      // round trip; leaving an origin again closes a round trip nobody marked as arrived. Never blocks the change.
+      // A round trip report is made automatically at one moment only: the bus is marked Arrived at an origin
+      // terminal (Lahore, Multan). Boarding and Departed never make one. Never blocks the change.
       let autoReport = null;
       if (b.status === 'arrived' && t.status !== 'arrived') autoReport = await autoCreateReport(client, { tripId: id, userId: req.user.id });
-      if (['boarding', 'departed'].includes(b.status)) autoReport = await closePreviousRoundTrip(client, { tripId: id, userId: req.user.id });
       return { trip, affectedBookings, autoReport };
     });
 

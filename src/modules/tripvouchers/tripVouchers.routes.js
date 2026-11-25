@@ -21,7 +21,6 @@ import {
   buildSnapshot, canGenerateAt, generateVoucher, loadTrip, loadVoucher, paidPassengers, PAID, replaceVoucher,
   terminalDeductions, voucherStops,
 } from './tripVouchers.service.js';
-import { closePreviousRoundTrip } from '../roundtrips/roundtrips.sync.js';
 import { cargoListsReady, openListTotals } from '../cargo/cargo.lists.js';
 import { counterSlips } from '../loads/loads.service.js';
 
@@ -264,9 +263,6 @@ router.post(
         ...(v.loadSlips ? { loadAmount: v.loadSlips.total, loadSlips: v.loadSlips.count } : {}),
       };
       await audit({ req, client, action: 'trip_voucher.generate', entityType: 'trip_voucher', entityId: v.id, newData: { voucherNo: v.voucherNo, tripId: req.valid.params.id, ...b, ...fromList } });
-      // The bus is leaving its first terminal: if that is Lahore or Multan, a round trip nobody marked as arrived is closed.
-      const first = await one(`SELECT 1 FROM route_stops rs JOIN trips t ON t.route_id = rs.route_id WHERE t.id = $1 AND rs.id = $2 AND rs.stop_order = 1`, [req.valid.params.id, b.boardingStopId], client);
-      if (first) await closePreviousRoundTrip(client, { tripId: req.valid.params.id, userId: req.user.id });
       return v;
     });
     res.status(201).json({ data: await loadVoucher(made.id) });
