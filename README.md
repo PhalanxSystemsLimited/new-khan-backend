@@ -294,6 +294,13 @@ Rules:
   counter sale and the conductor's roadside passenger. Error `CNIC_REQUIRED` (400) without one. Made-up numbers
   (one digit repeated, leading 0, 12345-6789012-3) are refused everywhere. It stays optional at sign-up.
 - **Refunds.** The amount always comes from the cancellation rules. Every booking stores its holder's CNIC (`holder_cnic`).
+  - *Never more than was received.* The percentage applies to the fare still held: each payment counts for what is left
+    of it after the refunds already recorded against it, capped at the booking total. A booking paid twice (two tabs) gets
+    the duplicate back in full and the fare at the policy percentage, nothing more; a cancelled trip gives back each
+    payment's remainder (`refundQuote` in `bookings.service.js`).
+  - *Staff and paid bookings.* `POST /bookings/:id/cancel` on someone else's **paid** booking is refused for counter staff
+    and managers (`USE_COUNTER_REFUND`, 403): they use the counter refund below, which confirms the holder first. Only an
+    admin may cancel one without the customer (the refund waits for approval). Unpaid holds are cancelled as before.
   - *Online* (customer cancels online, or the booking was paid online): refund is `requested`; only a **super admin** may
     approve/reject/mark it paid (`PATCH /admin/refunds/:id`), after sending the money back through Safepay.
   - *Counter* (`POST /bookings/:id/counter-cancel`, any staff role): staff confirm the holder by CNIC match. Bookings made
@@ -327,7 +334,7 @@ expired reservation (last 7 days) and then calls `POST /bookings/expiry-seen`, w
 | Role | Can |
 |---|---|
 | `customer` | Book online, see/cancel own bookings |
-| `agent` (**Counter staff**) | Tied to one terminal (`users.terminal_id`). Counter sales (cash), bookings, manifests, boarding, vouchers; generates the terminal voucher of **their own terminal** only. No cargo: they only **view** a bus's cargo list (voucher page) |
+| `agent` (**Counter staff**) | Tied to one terminal (`users.terminal_id`). Counter sales (cash), bookings, manifests, boarding, vouchers; generates the terminal voucher of **their own terminal** only. No cargo: they only **view** a bus's cargo list (voucher page). **Trip status**, by where their terminal is on the bus's route (`assertCounterMayChange` in `trips.routes.js`): where the bus *starts*: boarding, delayed (minutes), back to scheduled, departed; a *middle* stop: only "Report delay" (the minutes late; status unchanged), until that terminal's own voucher is generated; where it *ends*: arrived. Never cancel, never open/close booking, never a bus that does not call at their terminal |
 | `cargo` (**Cargo staff**) | Tied to one terminal. Books parcels from it, loads cargo onto the buses leaving it (the *Cargo screen*), receives and hands over parcels arriving there. No tickets, vouchers or trip reports |
 | `conductor` | Only the conductor screen of trips they are the conductor (or stand-in) of: live seats and passengers, road passengers, no-shows |
 | `manager` | Everything counter staff and cargo staff can, at any terminal + trip status, bus and crew, replacement vouchers, reading refunds and reports |
@@ -344,7 +351,12 @@ The very first super admin is set in SQL (§2.1 step 4). People who work but do 
 counter staff press *Generate voucher*. It gets a 10-digit number from the same series as the report vouchers, is frozen, lists the
 paid passengers boarding there by destination, how many are on the bus after the terminal, terminal cash (paid in cash at the
 counter), online paid, load, cargo and the terminal's fixed deductions (*Terminal deductions*), and the cash handed to the conductor.
-Generating it closes booking from that terminal (search and counter). A trip cannot board, depart or generate vouchers without a
+Generating it closes booking from that terminal (search and counter). A paid passenger the conductor marks *did not travel*
+keeps their fare in the money figures (terminal cash / online paid, and road income on the report): no-shows are not refunded;
+only the seat counts leave them out, and the voucher lists them as "(did not travel)". The conductor can mark a no-show until
+the bus arrives; after that only a manager or admin. **A bus cannot be marked Arrived** while a terminal that sold tickets, took
+load money or loaded parcels has no voucher (`VOUCHER_MISSING`, 422, naming the terminals): after arrival nothing can be added,
+so that cash would be on no voucher. For a trip that arrived before this rule, a manager or admin can still generate the missed voucher. A trip cannot board, depart or generate vouchers without a
 conductor. A replacement voucher (bus swap) needs a manager or admin and a reason; cancelling a trip voids its vouchers. The conductor
 opens the trip by voucher number at `/admin/conductor` and books road passengers (channel `on_road`, fare typed in or free), which
 blocks those seats for every later terminal.
@@ -540,7 +552,7 @@ Access: **public**, **C** = any signed-in user, **owner** = the booking's custom
 | PATCH | `/trips/:id/assignment` | S | Bus & crew. Saving with a `busId` **confirms** the bus: same seat layout, active, not on another confirmed trip then (a different class is allowed, with a `warnings` line). Counter staff: departures leaving from their own terminal, before the bus leaves, no stand-in |
 | GET | `/trips/:id/bus-options` | S | Active buses with the trip's seat layout, each with `busyTripId` (the confirmed trip it is on then) |
 | GET · POST | `/trips/extra-options?terminalId=` · `/trips/extra` | S | Extra departure for a busy day `{ routeId, departureAt, layoutId + busClass \| busId, allowNear? }`: on sale at once; without a bus it is planned (bus to confirm). Counter staff: routes leaving their terminal. Another departure on the route within 30 min → 409 `NEAR_DEPARTURE` until sent with `allowNear` |
-| PATCH | `/trips/:id/status` | S (cancel = A) | boarding / departed / arrived / delayed / cancelled. Boarding and departed need a confirmed bus (and a conductor) |
+| PATCH | `/trips/:id/status` | S (cancel = A) | boarding / departed / arrived / delayed / cancelled. Boarding and departed need a confirmed bus (and a conductor). Arrived needs the voucher of every terminal that sold on the bus. Managers and admins: any trip. Counter staff: only as their terminal's place on the route allows (roles table, §6.5); a middle stop sends the current status with `delayMinutes` |
 | GET | `/cargo/setup` · `/cargo/quote` | CG | Cargo: terminals, rates, settings; the rate-table charge. **CG** = cargo staff, managers and admins (not counter staff) |
 | PUT · POST · PATCH | `/cargo/settings` · `/cargo/rates[/:id]` | A | Cargo rules / not-allowed text printed on the slip, overdue days, staff may change charge; rates per city pair (per kg, per piece, minimum) |
 | GET · POST | `/cargo/parcels` | CG | Search parcels (CG number or scanned QR link, phone, CNIC, name) · book a parcel (cargo staff: own terminal only; lower charge needs a reason) |
@@ -557,7 +569,7 @@ Access: **public**, **C** = any signed-in user, **owner** = the booking's custom
 | GET | `/bookings/me` | C | Own bookings (incl. `holdExpiresAt`, `expirySeenAt`, `paymentReceived`) |
 | POST | `/bookings/expiry-seen` | C | `{ ids: [...] }` mark "reservation expired" notice as seen |
 | GET | `/bookings/lookup?pnr&phone` | public | One booking by PNR + phone (reduced view) |
-| GET | `/bookings/lookup-phone?phone` | public | All bookings for a mobile number (no passenger details) |
+| GET | `/bookings/lookup-phone?phone` | public | The journeys booked with a mobile number: route, terminals, date, status, amount, seat count. **No booking reference and no seat numbers** (reference + phone opens the full ticket, so a phone number alone must not give the reference). A customer who lost the reference signs in or asks at a counter |
 | GET | `/bookings` | S | Search bookings (`pnr`, `phone`, `status`, `tripId`; managers also `terminalId`). Counter staff: only bookings boarding at their terminal, unless searching by `pnr` or `phone` (then every terminal). Each row has `boardingCity`, `droppingCity`, `boardingAt`; the answer has `scope` |
 | GET | `/bookings/:id` · `/bookings/:id/cancel-quote` | owner, S | Details, refund preview |
 | POST | `/bookings/:id/cancel` · `/bookings/:id/review` | owner, S | Cancel / review a completed trip |

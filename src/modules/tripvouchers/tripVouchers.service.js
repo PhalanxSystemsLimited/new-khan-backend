@@ -104,13 +104,18 @@ const fareOf = (p) => (p.isFree ? 0 : Math.round(Number(p.fareAmount) || 0));
 export function buildSnapshot({ stops, passengers, stop, deductions, loadAmount = 0, cargoAmount = 0 }) {
   const order = (sid) => stops.find((s) => s.id === sid)?.stopOrder ?? 999;
   const cityOf = (sid) => stops.find((s) => s.id === sid)?.city ?? '?';
-  const boarding = passengers.filter((p) => p.boardingStopId === stop.id && p.status !== 'no_show');
+  // Everyone who PAID to board here. A passenger marked "did not travel" (no-show) paid too and is not refunded:
+  // the fare stays in the money figures. Only the seat counts leave them out.
+  const paidHere = passengers.filter((p) => p.boardingStopId === stop.id);
+  const boarding = paidHere.filter((p) => p.status !== 'no_show');
 
   const lines = new Map();
-  for (const p of boarding) {
+  for (const p of paidHere) {
     const l = lines.get(p.droppingStopId) ?? { destinationStopId: p.droppingStopId, destination: cityOf(p.droppingStopId), seats: 0, freeSeats: 0, fare: 0 };
-    l.seats += 1;
-    if (p.isFree) l.freeSeats += 1;
+    if (p.status !== 'no_show') {
+      l.seats += 1;
+      if (p.isFree) l.freeSeats += 1;
+    }
     l.fare += fareOf(p);
     lines.set(p.droppingStopId, l);
   }
@@ -120,14 +125,14 @@ export function buildSnapshot({ stops, passengers, stop, deductions, loadAmount 
   const onBoard = passengers.filter(
     (p) => p.status !== 'no_show' && order(p.boardingStopId) <= stop.stopOrder && order(p.droppingStopId) > stop.stopOrder,
   );
-  const cash = boarding.filter((p) => p.paidBy === 'cash').reduce((s, p) => s + fareOf(p), 0);
-  const online = boarding.filter((p) => p.paidBy && p.paidBy !== 'cash').reduce((s, p) => s + fareOf(p), 0);
+  const cash = paidHere.filter((p) => p.paidBy === 'cash').reduce((s, p) => s + fareOf(p), 0);
+  const online = paidHere.filter((p) => p.paidBy && p.paidBy !== 'cash').reduce((s, p) => s + fareOf(p), 0);
   const deductionsTotal = deductions.reduce((s, d) => s + d.amount, 0);
 
   return {
     lines: sortedLines,
     seatsBoarding: boarding.length,
-    fareBoarding: boarding.reduce((s, p) => s + fareOf(p), 0),
+    fareBoarding: paidHere.reduce((s, p) => s + fareOf(p), 0),
     onBoard: onBoard.length,
     freeOnBoard: onBoard.filter((p) => p.isFree).length,
     terminalCash: cash,
@@ -137,15 +142,52 @@ export function buildSnapshot({ stops, passengers, stop, deductions, loadAmount 
     deductions: deductions.map((d) => ({ categoryId: d.categoryId, name: d.name, amount: d.amount })),
     deductionsTotal,
     cashToConductor: cash + loadAmount + cargoAmount - deductionsTotal,
-    passengers: boarding.map((p) => ({
-      ticketId: p.ticketId, seat: p.seatNumber, name: p.passengerName, gender: p.passengerGender,
+    // The list keeps a no-show too (marked), so the money on the voucher adds up to the names on it.
+    passengers: paidHere.map((p) => ({
+      ticketId: p.ticketId, seat: p.seatNumber,
+      name: p.status === 'no_show' ? `${String(p.passengerName).slice(0, 100)} (did not travel)` : p.passengerName,
+      gender: p.passengerGender,
       destination: cityOf(p.droppingStopId), fare: fareOf(p), paidBy: p.paidBy, isFree: p.isFree,
     })),
   };
 }
 
+/**
+ * The terminals of a trip that took money or goods but have no voucher yet: paid passengers boarding there
+ * (road passengers are the conductor's, not a terminal's), open counter load slips, or parcels on an open cargo
+ * list. A bus is not marked Arrived while this list is not empty: after arrival nothing more could be added to a
+ * voucher, so that terminal's cash would be on none and its parcels could not be received at the destination.
+ * Returns [{ stopId, city }].
+ */
+export async function terminalsMissingVoucher(client, tripId) {
+  const loaded = await loadTrip(tripId, client);
+  if (!loaded) return [];
+  const { rows: have } = await query(`SELECT boarding_stop_id FROM trip_vouchers WHERE trip_id = $1 AND status = 'generated'`, [tripId], client);
+  const done = new Set(have.map((v) => v.boardingStopId));
+  const open = voucherStops(loaded.stops).filter((s) => !done.has(s.id));
+  if (!open.length) return [];
+  const { rows: sold } = await query(
+    `SELECT DISTINCT bk.boarding_stop_id FROM tickets tk JOIN bookings bk ON bk.id = tk.booking_id
+     WHERE tk.trip_id = $1 AND tk.status IN ${PAID} AND bk.channel <> 'on_road'`,
+    [tripId],
+    client,
+  );
+  const soldAt = new Set(sold.map((r) => r.boardingStopId));
+  const cargoReady = await cargoListsReady(client);
+  const missing = [];
+  for (const s of open) {
+    const slips = await counterSlips(client, { tripId, stopId: s.id });
+    const list = cargoReady ? await openListTotals(client, tripId, s.id) : null;
+    if (soldAt.has(s.id) || (slips && slips.count > 0) || list) missing.push({ stopId: s.id, city: s.city });
+  }
+  return missing;
+}
+
 /** Terminals a voucher can be made at: boarding points, except the last stop. */
 export const voucherStops = (stops) => stops.filter((s, i) => s.isBoardingPoint && i < stops.length - 1);
+
+/** Who may generate a voucher that was missed, after the trip has arrived. */
+export const LATE_VOUCHER_ROLES = ['manager', 'admin', 'super_admin'];
 
 /** Counter staff only at their own terminal; managers and admins anywhere. */
 export function canGenerateAt(user, stop) {
@@ -195,7 +237,11 @@ async function insertVoucher(client, v) {
 export async function generateVoucher(client, { tripId, boardingStopId, loadAmount, cargoAmount, user }) {
   const lock = await one(`SELECT id, status FROM trips WHERE id = $1 FOR UPDATE`, [tripId], client);
   if (!lock) throw AppError.notFound('Trip not found');
-  if (['cancelled', 'arrived'].includes(lock.status)) throw AppError.unprocessable(`This trip is ${lock.status}.`);
+  if (lock.status === 'cancelled') throw AppError.unprocessable('This trip is cancelled.');
+  // After arrival a voucher is only made to put right a terminal that was missed: a manager or admin does it.
+  if (lock.status === 'arrived' && !LATE_VOUCHER_ROLES.includes(user.role)) {
+    throw AppError.unprocessable('This trip has arrived. A manager or admin can still generate a voucher that was missed.');
+  }
 
   const { trip, stops } = await loadTrip(tripId, client);
   const stop = voucherStops(stops).find((s) => s.id === boardingStopId);

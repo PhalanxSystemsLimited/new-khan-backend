@@ -126,10 +126,13 @@ export async function reportChecks(client, roundTripId) {
 /** The figures of one report row, from a generated terminal voucher. */
 async function figuresFor(client, tv) {
   // One after another: these run on the transaction's single connection.
+  // Road passengers: those who travelled are counted; the money counts every paid one. A passenger the conductor
+  // marked "did not travel" still paid him, so the fare stays in the income (it used to drop out of the report).
   const road = await one(
-    `SELECT count(*)::int AS pax, COALESCE(sum(CASE WHEN tk.is_free THEN 0 ELSE tk.fare_amount END), 0)::int AS income
+    `SELECT count(*) FILTER (WHERE tk.status <> 'no_show')::int AS pax,
+            COALESCE(sum(CASE WHEN tk.is_free THEN 0 ELSE tk.fare_amount END), 0)::int AS income
      FROM tickets tk JOIN bookings bk ON bk.id = tk.booking_id
-     WHERE tk.trip_id = $1 AND bk.channel = 'on_road' AND bk.boarding_stop_id = $2 AND tk.status IN ('confirmed', 'boarded')`,
+     WHERE tk.trip_id = $1 AND bk.channel = 'on_road' AND bk.boarding_stop_id = $2 AND tk.status IN ('confirmed', 'boarded', 'no_show')`,
     [tv.tripId, tv.boardingStopId],
     client,
   );

@@ -2,7 +2,7 @@ import { createHash, randomInt } from 'node:crypto';
 import { query, one, withTransaction } from '../../config/db.js';
 import { env } from '../../config/env.js';
 import { AppError } from '../../utils/AppError.js';
-import { isStaff, MANAGER_ROLES } from '../../middleware/auth.js';
+import { isStaff, ADMIN_ROLES, MANAGER_ROLES } from '../../middleware/auth.js';
 import { cnicDigits, cnicDisplay, cnicMasked } from '../../utils/cnic.js';
 import { sendSms, smsEnabled } from '../../utils/sms.js';
 import { findFare } from '../fares/fares.service.js';
@@ -320,14 +320,33 @@ export async function confirmBookingInTx(client, bookingId) {
 // ---------------------------------------------------------------------------
 // Cancellation
 // ---------------------------------------------------------------------------
+/**
+ * What a cancellation gives back. The percentage applies to the FARE the customer is still out of pocket for:
+ *  - each payment counts for what is left of it after the refunds already recorded against it, so a duplicate
+ *    payment that has its own full refund (two browser tabs) is not refunded a second time here;
+ *  - never more than the booking's total, and never more than the money still held.
+ * Before this, the percentage was taken of every payment added together: a booking paid twice and then cancelled
+ * was refunded more than was ever received.
+ */
 async function refundQuote(client, booking) {
-  const paid = await one(
-    `SELECT COALESCE(sum(amount), 0) AS total, (array_agg(id ORDER BY amount DESC))[1] AS payment_id,
-            (array_agg(method ORDER BY amount DESC))[1] AS method
-     FROM payments WHERE booking_id = $1 AND status = 'succeeded'`,
+  const { rows: pays } = await query(
+    `SELECT p.id, p.method::text AS method,
+            p.amount - COALESCE((SELECT sum(r.amount) FROM refunds r WHERE r.payment_id = p.id AND r.status <> 'rejected'), 0) AS remaining
+     FROM payments p
+     WHERE p.booking_id = $1 AND p.status = 'succeeded'
+     ORDER BY 3 DESC, p.paid_at NULLS LAST, p.id`,
     [booking.id],
     client,
   );
+  const live = pays.map((p) => ({ ...p, remaining: Number(p.remaining) })).filter((p) => p.remaining > 0);
+  const held = round2(live.reduce((s, p) => s + p.remaining, 0));
+  // The refund goes against the payment with the most left (the fare payment).
+  const top = live[0] ?? null;
+  const paid = {
+    total: Math.min(held, Number(booking.totalAmount ?? held)),
+    paymentId: top?.id ?? null,
+    method: top?.method ?? null,
+  };
   const hoursBefore = (new Date(booking.departureAt).getTime() - Date.now()) / 3_600_000;
   if (hoursBefore <= 0) {
     return { paid: paid.total, refundPercent: 0, refundAmount: 0, fee: paid.total, paymentId: paid.paymentId, method: paid.method, hoursBefore };
@@ -340,7 +359,7 @@ async function refundQuote(client, booking) {
     client,
   );
   const pct = policy?.refundPercent ?? 0;
-  const refundAmount = round2((paid.total * pct) / 100);
+  const refundAmount = Math.min(round2((paid.total * pct) / 100), top?.remaining ?? 0);
   return {
     paid: paid.total,
     refundPercent: pct,
@@ -354,7 +373,8 @@ async function refundQuote(client, booking) {
 
 async function lockBookingWithTrip(client, id) {
   return one(
-    `SELECT bk.id, bk.pnr, bk.user_id, bk.status, bk.holder_cnic, bk.contact_phone, t.departure_at, t.status AS trip_status
+    `SELECT bk.id, bk.pnr, bk.user_id, bk.status, bk.holder_cnic, bk.contact_phone, bk.total_amount,
+            t.departure_at, t.status AS trip_status
      FROM bookings bk JOIN trips t ON t.id = bk.trip_id
      WHERE bk.id = $1 FOR UPDATE OF bk`,
     [id],
@@ -379,6 +399,16 @@ export async function cancelBooking(id, user, reason) {
     if (!['pending', 'confirmed'].includes(bk.status)) throw AppError.unprocessable(`Booking is already ${bk.status}`);
     if (!['scheduled', 'delayed'].includes(bk.tripStatus) && !isStaff(user)) {
       throw AppError.unprocessable('This booking can no longer be cancelled online');
+    }
+    // A PAID booking of someone else: counter staff and managers cancel it with the counter refund, which confirms
+    // the holder (CNIC) first. Only an admin may cancel one without the customer (the refund then waits for approval).
+    // Unpaid holds, and a staff member's own booking, are cancelled here as before.
+    if (bk.status === 'confirmed' && isStaff(user) && bk.userId !== user.id && !ADMIN_ROLES.includes(user.role)) {
+      throw new AppError(
+        403,
+        "A paid booking is cancelled with the counter refund, which checks the customer's CNIC first. Use \"Cancel and refund (customer at counter)\".",
+        'USE_COUNTER_REFUND',
+      );
     }
 
     let refund = null;

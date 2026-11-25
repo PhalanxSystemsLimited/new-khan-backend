@@ -116,8 +116,10 @@ router.get('/me', requireAuth, validate({ query: pagination.strict() }), async (
 
 /**
  * Public lookup by mobile number alone: every booking made with that contact number, newest first.
- * Deliberately reduced (no passenger names, CNICs, emails or payment details): enough to recognise a trip
- * and read its booking number. Rate limited like the PNR lookup.
+ * Deliberately reduced: the journey, its date and status, enough to see that a booking exists. It does NOT give
+ * the booking reference or the seat numbers: the reference together with the phone number opens the full ticket
+ * (/lookup below), so handing it out here let anyone who knew a mobile number open that person's ticket.
+ * A customer who has lost the reference signs in to their account or asks at a counter. Rate limited.
  */
 router.get(
   '/lookup-phone',
@@ -126,11 +128,10 @@ router.get(
   async (req, res) => {
     await reconcileUnsettled('bk.contact_phone = $1', [req.valid.query.phone]);
     const { rows } = await query(
-      `SELECT bk.pnr, bk.status, bk.total_amount, bk.currency, bk.created_at, r.name AS route_name,
+      `SELECT bk.status, bk.total_amount, bk.currency, bk.created_at, r.name AS route_name,
               bt.name AS boarding_terminal, dt.name AS dropping_terminal,
               t.departure_at + make_interval(mins => bs.minutes_from_origin) AS boarding_at,
-              (SELECT array_agg(ls.seat_number ORDER BY ${seatOrder('ls')}) FROM tickets tk JOIN layout_seats ls ON ls.id = tk.seat_id
-                WHERE tk.booking_id = bk.id) AS seat_numbers
+              (SELECT count(*) FROM tickets tk WHERE tk.booking_id = bk.id)::int AS seats
        FROM bookings bk
        JOIN trips t ON t.id = bk.trip_id JOIN routes r ON r.id = t.route_id
        JOIN route_stops bs ON bs.id = bk.boarding_stop_id JOIN terminals bt ON bt.id = bs.terminal_id

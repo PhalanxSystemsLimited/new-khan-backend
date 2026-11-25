@@ -8,6 +8,7 @@ import { autoCreateReport } from '../roundtrips/roundtrips.sync.js';
 import { assertBusFree, createExtraDeparture, createTripWithReturn } from './trips.create.js';
 import { busConfirmReady, confirmedSql, CONFIRM_FIRST } from './busConfirm.js';
 import { customRouteSchema, findOrCreateRoute } from '../routes/customRoute.js';
+import { terminalsMissingVoucher } from '../tripvouchers/tripVouchers.service.js';
 import { cargoListsReady, voidListsForCancelledTrip } from '../cargo/cargo.lists.js';
 import { expireStaleSoon } from '../../jobs/expireBookings.js';
 import { searchLimiter } from '../../middleware/rateLimit.js';
@@ -303,6 +304,8 @@ router.get(
     const { rows } = await query(
       `SELECT t.*, ${confirmed} AS bus_confirmed, r.name AS route_name, r.origin_terminal_id,
               my.here_at, my.here_city, -- counter staff: when the bus is at their terminal (delay included)
+              -- counter staff: their own terminal's voucher is generated (the bus has left them)
+              EXISTS (SELECT 1 FROM trip_vouchers mv WHERE mv.trip_id = t.id AND mv.boarding_stop_id = my.stop_id AND mv.status = 'generated') AS my_voucher_done,
               b.registration_no, b.fleet_no, b.layout_id, b.bus_class, d.full_name AS driver_name,
               cn.full_name AS conductor_name, si.full_name AS stand_in_conductor_name,
               (SELECT count(*) FROM tickets tk WHERE tk.trip_id = t.id AND tk.status IN ${ACTIVE_TICKET})::int AS seats_taken,
@@ -442,9 +445,49 @@ const TRANSITIONS = {
   cancelled: [],
 };
 
+/**
+ * What counter staff may do to a trip's status. The person at the counter is the one who sees the bus, so they
+ * update it; a trip has ONE status for the whole journey, so what they may do depends on where their terminal is:
+ *   - where the bus STARTS: boarding, delayed (with minutes), back to scheduled, departed;
+ *   - a MIDDLE stop: only report how late the bus is (delay minutes; the status itself does not change), until
+ *     that terminal's own voucher is generated (after that the bus has left them);
+ *   - where the bus ENDS: arrived.
+ * Never: cancel a trip (admins), open or close booking, or touch a bus that does not call at their terminal.
+ */
+async function assertCounterMayChange(client, user, t, b) {
+  const mine = user.terminalId;
+  if (!mine) throw AppError.forbidden('Your account has no terminal. Ask an admin to set one.');
+  if (b.bookingOpen !== undefined) throw AppError.forbidden('Only a manager or admin can open or close booking on a trip.');
+  if (b.status === 'cancelled') throw AppError.forbidden('Only admins can cancel trips');
+
+  if (b.status === 'arrived') {
+    if (mine !== t.destinationTerminalId) throw AppError.forbidden('Only the terminal where the bus ends (or a manager) can mark it arrived.');
+    return;
+  }
+  if (mine === t.originTerminalId) return; // boarding / delayed / scheduled / departed: the usual order is checked below
+
+  // A middle stop: the delay only.
+  const stop = await one(
+    `SELECT rs.id, c.name AS city,
+            EXISTS (SELECT 1 FROM trip_vouchers v WHERE v.trip_id = $1 AND v.boarding_stop_id = rs.id AND v.status = 'generated') AS voucher_done
+     FROM route_stops rs JOIN terminals tm ON tm.id = rs.terminal_id JOIN cities c ON c.id = tm.city_id
+     WHERE rs.route_id = $2 AND rs.terminal_id = $3`,
+    [t.id, t.routeId, mine],
+    client,
+  );
+  if (!stop || mine === t.destinationTerminalId) {
+    throw AppError.forbidden(stop ? 'At the terminal where the bus ends you can only mark it arrived.' : 'This bus does not call at your terminal.');
+  }
+  if (b.status !== t.status || b.delayMinutes === undefined) {
+    throw AppError.forbidden(`From ${stop.city} you can report how late this bus is. Its status is changed by the terminal it leaves from, or a manager.`);
+  }
+  if (['arrived', 'cancelled'].includes(t.status)) throw AppError.conflict(`This trip is ${t.status}.`);
+  if (stop.voucherDone) throw AppError.conflict(`The ${stop.city} voucher is generated: the bus has left ${stop.city}. The next terminal reports any further delay.`);
+}
+
 router.patch(
   '/:id/status',
-  ...staff, // counter staff: only "arrived", at their own terminal (checked below); everything else: managers and up
+  ...staff, // counter staff: what assertCounterMayChange allows at their own terminal; everything: managers and up
   validate({
     params: bigIdParam,
     body: z
@@ -467,18 +510,14 @@ router.patch(
     const result = await withTransaction(async (client) => {
       const confirmed = await confirmedSql('t', client);
       const t = await one(
-        `SELECT t.id, t.status, t.conductor_id, t.stand_in_conductor_id, r.destination_terminal_id, ${confirmed} AS bus_confirmed
+        `SELECT t.id, t.status, t.route_id, t.conductor_id, t.stand_in_conductor_id, r.origin_terminal_id, r.destination_terminal_id,
+                ${confirmed} AS bus_confirmed
          FROM trips t JOIN routes r ON r.id = t.route_id WHERE t.id = $1 FOR UPDATE OF t`,
         [id],
         client,
       );
       if (!t) throw AppError.notFound('Trip not found');
-      if (!MANAGER_ROLES.includes(req.user.role)) {
-        // Counter staff see the bus come in: they may mark Arrived for buses ending at their own terminal, nothing else.
-        if (b.status !== 'arrived' || !req.user.terminalId || req.user.terminalId !== t.destinationTerminalId) {
-          throw AppError.forbidden('Counter staff can only mark buses as arrived at their own terminal.');
-        }
-      }
+      if (!MANAGER_ROLES.includes(req.user.role)) await assertCounterMayChange(client, req.user, t, b);
       if (t.status !== b.status && !TRANSITIONS[t.status].includes(b.status)) {
         throw AppError.conflict(`Cannot change trip from ${t.status} to ${b.status}`);
       }
@@ -488,6 +527,21 @@ router.patch(
       }
       if (['boarding', 'departed'].includes(b.status) && !t.conductorId && !t.standInConductorId) {
         throw AppError.unprocessable('Assign a conductor first (Bus & crew). The bus cannot leave without one.');
+      }
+      // Arrived closes the trip: nothing can be added to a voucher afterwards. A terminal that sold tickets, took
+      // load money or loaded parcels must have its voucher first, or that cash would be on no voucher and its
+      // parcels could not be received at the destination.
+      if (b.status === 'arrived' && t.status !== 'arrived') {
+        const missing = await terminalsMissingVoucher(client, id);
+        if (missing.length) {
+          const names = missing.map((m) => m.city).join(', ');
+          throw new AppError(
+            422,
+            `Generate the terminal voucher for ${names} first. ${missing.length === 1 ? 'That terminal has' : 'Those terminals have'} sales, load or cargo on this bus that are not on a voucher yet. Its counter staff or a manager can generate it (Terminal vouchers); then mark the bus arrived.`,
+            'VOUCHER_MISSING',
+            missing.map((m) => ({ field: 'status', message: `${m.city}: voucher not generated` })),
+          );
+        }
       }
 
       const trip = await one(
@@ -511,11 +565,16 @@ router.patch(
           client,
         );
         affectedBookings = bookings.length;
+        // Each payment is given back in full, less any refund already recorded against it (a duplicate payment
+        // has its own refund): never more than was received.
         await client.query(
           `INSERT INTO refunds (payment_id, booking_id, amount, cancellation_fee, status, reason)
-           SELECT p.id, p.booking_id, p.amount, 0, 'approved', 'Trip cancelled by operator'
+           SELECT p.id, p.booking_id, x.remaining, 0, 'approved', 'Trip cancelled by operator'
            FROM payments p
-           WHERE p.booking_id = ANY ($1::uuid[]) AND p.status = 'succeeded'`,
+           CROSS JOIN LATERAL (
+             SELECT p.amount - COALESCE((SELECT sum(r.amount) FROM refunds r WHERE r.payment_id = p.id AND r.status <> 'rejected'), 0) AS remaining
+           ) x
+           WHERE p.booking_id = ANY ($1::uuid[]) AND p.status = 'succeeded' AND x.remaining > 0`,
           [bookings.map((x) => x.id)],
         );
         // Its vouchers are voided; their numbers stay on record.

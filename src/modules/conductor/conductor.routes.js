@@ -202,10 +202,19 @@ router.post(
   validate({ params: z.object({ ticketId: uuid }).strict(), body: z.object({ note: text(2, 300) }).strict() }),
   async (req, res) => {
     const out = await withTransaction(async (client) => {
+      const found = await one(`SELECT trip_id FROM tickets WHERE id = $1`, [req.valid.params.ticketId], client);
+      if (!found) throw AppError.notFound('Passenger not found');
+      // The trip first (the same lock as sales and voucher generation), then the ticket.
+      const lock = await one(`SELECT id, status FROM trips WHERE id = $1 FOR UPDATE`, [found.tripId], client);
       const t = await one(`SELECT id, trip_id, status FROM tickets WHERE id = $1 FOR UPDATE`, [req.valid.params.ticketId], client);
       if (!t) throw AppError.notFound('Passenger not found');
       const loaded = await loadTrip(t.tripId, client);
       assertTripAccess(req.user, loaded.trip);
+      // Once the bus has arrived the journey is over: the conductor can no longer change who travelled.
+      // A manager or admin can still correct a mistake. (The fare of a no-show stays as income either way.)
+      if (['arrived', 'cancelled'].includes(lock.status) && !MANAGER_ROLES.includes(req.user.role)) {
+        throw AppError.unprocessable(`This trip is ${lock.status}. A manager or admin can still correct who travelled.`);
+      }
       if (!['confirmed', 'boarded'].includes(t.status)) throw AppError.unprocessable('Only a paid passenger can be marked as not travelled.');
       await client.query(`UPDATE tickets SET status = 'no_show', no_show_note = $2 WHERE id = $1`, [t.id, req.valid.body.note]);
       await audit({ req, client, action: 'conductor.no_show', entityType: 'trip', entityId: t.tripId, newData: { ticketId: t.id, note: req.valid.body.note } });

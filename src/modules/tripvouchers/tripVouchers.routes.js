@@ -18,7 +18,7 @@ import { AppError } from '../../utils/AppError.js';
 import { audit } from '../../utils/audit.js';
 import { bigIdParam, intId, isoDate, pagination, text } from '../../utils/schemas.js';
 import {
-  buildSnapshot, canGenerateAt, generateVoucher, loadTrip, loadVoucher, paidPassengers, PAID, replaceVoucher,
+  buildSnapshot, canGenerateAt, generateVoucher, LATE_VOUCHER_ROLES, loadTrip, loadVoucher, paidPassengers, PAID, replaceVoucher,
   terminalDeductions, voucherStops,
 } from './tripVouchers.service.js';
 import { cargoListsReady, openListTotals } from '../cargo/cargo.lists.js';
@@ -184,7 +184,8 @@ router.get('/:id', validate({ params: bigIdParam }), async (req, res) => {
       preview,
       cargo, // null: cargo not set up; parcelCount > 0: the voucher's Cargo comes from the list
       load, // null: load slips not set up (Load typed by hand); else { count, total, slips }: the voucher's Load
-      canGenerate: !live && canGenerateAt(req.user, s) && !['cancelled', 'arrived'].includes(trip.status),
+      // After arrival only a manager or admin may still make a voucher that was missed.
+      canGenerate: !live && canGenerateAt(req.user, s) && trip.status !== 'cancelled' && (trip.status !== 'arrived' || LATE_VOUCHER_ROLES.includes(req.user.role)),
     });
   }
 
