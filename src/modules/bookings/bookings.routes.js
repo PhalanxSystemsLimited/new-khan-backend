@@ -3,7 +3,7 @@ import { z } from 'zod';
 import { query, one } from '../../config/db.js';
 import { validate } from '../../middleware/validate.js';
 import { optionalAuth, requireAuth, requireRole, STAFF_ROLES, isStaff } from '../../middleware/auth.js';
-import { bookingLimiter, lookupLimiter, otpLimiter } from '../../middleware/rateLimit.js';
+import { bookingLimiter, lookupLimiter, otpLimiter, promoLimiter } from '../../middleware/rateLimit.js';
 import { AppError } from '../../utils/AppError.js';
 import { audit } from '../../utils/audit.js';
 import { offsetOf, paged } from '../../utils/sql.js';
@@ -12,7 +12,7 @@ import {
 } from '../../utils/schemas.js';
 import {
   assertCanAccess, cancelBooking, counterCancel, createBooking, getBookingDetail, getCancellationQuote, getCounterQuote,
-  sendCounterCode,
+  previewPromo, sendCounterCode,
 } from './bookings.service.js';
 import { reconcileSafepayBooking } from '../payments/payments.routes.js';
 import { checkTicket, ticketQrFor } from './ticketQr.js';
@@ -105,6 +105,31 @@ const createSchema = z
   .strict()
   .refine((b) => b.boardingStopId !== b.droppingStopId, 'Boarding and dropping stops must differ')
   .refine((b) => new Set(b.passengers.map((p) => p.seatId)).size === b.passengers.length, 'Each seat can be selected only once');
+
+/**
+ * "Apply" on the website's promo box: what the code would take off these seats, before reserving. Nothing is saved
+ * and the code is not used up; the booking itself checks the code again. Signed-in customers only.
+ */
+router.post(
+  '/promo-check',
+  requireAuth,
+  promoLimiter,
+  validate({
+    body: z
+      .object({
+        tripId: bigId,
+        boardingStopId: intId,
+        droppingStopId: intId,
+        seats: z.number().int().min(1).max(20),
+        code: z.string().trim().regex(/^[A-Za-z0-9_-]{3,30}$/, 'A promo code is 3 to 30 letters and numbers'),
+      })
+      .strict(),
+  }),
+  async (req, res) => {
+    res.set('Cache-Control', 'no-store');
+    res.json({ data: await previewPromo(req.user, req.valid.body) });
+  },
+);
 
 router.post('/', requireAuth, bookingLimiter, validate({ body: createSchema }), async (req, res) => {
   const body = req.valid.body;

@@ -106,6 +106,29 @@ async function applyPromo(client, { code, routeId, subtotal, userId }) {
   return { promoId: promo.id, discount: round2(discount) };
 }
 
+/**
+ * What a promo code would take off a booking, WITHOUT making the booking or using the code up: the website shows it
+ * when the customer presses "Apply". The same rules as the booking itself (applyPromo), on the same fare the booking
+ * would charge. The booking checks the code again when it is made: this is only a preview.
+ * Online customers only (promotions are not for the counter).
+ */
+export async function previewPromo(user, { tripId, boardingStopId, droppingStopId, seats, code }) {
+  if (isStaff(user)) throw AppError.unprocessable('Promo codes are for online bookings only, not at the counter.');
+  return withTransaction(async (client) => {
+    const trip = await one(
+      `SELECT t.id, t.route_id, t.departure_at, b.bus_class FROM trips t JOIN buses b ON b.id = t.bus_id WHERE t.id = $1`,
+      [tripId],
+      client,
+    );
+    if (!trip) throw AppError.notFound('Trip not found');
+    const fare = await findFare({ routeId: trip.routeId, fromStopId: boardingStopId, toStopId: droppingStopId, busClass: trip.busClass, departureAt: trip.departureAt }, client);
+    if (!fare) throw AppError.unprocessable('No fare is available for the selected stops');
+    const subtotal = round2(fare.amount * seats);
+    const { discount } = await applyPromo(client, { code, routeId: trip.routeId, subtotal, userId: user.id });
+    return { code: code.toUpperCase(), subtotal, discount, total: round2(subtotal - discount) };
+  });
+}
+
 // ---------------------------------------------------------------------------
 // Create
 // ---------------------------------------------------------------------------

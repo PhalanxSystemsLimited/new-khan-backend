@@ -587,6 +587,7 @@ Access: **public**, **C** = any signed-in user, **owner** = the booking's custom
 | GET | `/bookings/me` | C | Own bookings (incl. `holdExpiresAt`, `expirySeenAt`, `paymentReceived`) |
 | POST | `/bookings/expiry-seen` | C | `{ ids: [...] }` mark "reservation expired" notice as seen |
 | GET | `/bookings/lookup?pnr&phone` | public | One booking by PNR + phone (reduced view) |
+| POST | `/bookings/promo-check` | customer | "Apply" on the website's promo box: `{ tripId, boardingStopId, droppingStopId, seats, code }` → `{ code, subtotal, discount, total }`. A preview only: nothing is saved and the code is not used up; the booking checks the code again. Refused for staff (promo codes are online only). 15 tries per 15 minutes |
 | GET | `/bookings/lookup-phone?phone` | public | The journeys booked with a mobile number: route, terminals, date, status, amount, seat count. **No booking reference and no seat numbers** (reference + phone opens the full ticket, so a phone number alone must not give the reference). A customer who lost the reference signs in or asks at a counter |
 | GET | `/bookings` | S | Search bookings (`pnr`, `phone`, `status`, `tripId`; managers also `terminalId`). Counter staff: only bookings boarding at their terminal, unless searching by `pnr` or `phone` (then every terminal). Each row has `boardingCity`, `droppingCity`, `boardingAt`; the answer has `scope` |
 | GET | `/bookings/:id` · `/bookings/:id/cancel-quote` | owner, S | Details, refund preview |

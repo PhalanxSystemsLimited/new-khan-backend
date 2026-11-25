@@ -59,6 +59,15 @@ export const bookingLimiter = rateLimit({
   message: message('Too many booking attempts. Please try again later.'),
 });
 
+/** "Apply promo code" on the website: a customer tries a few codes, nobody guesses thousands. */
+export const promoLimiter = rateLimit({
+  ...base,
+  windowMs: 15 * 60 * 1000,
+  limit: 15,
+  keyGenerator: userOrIp,
+  message: message('Too many promo codes tried. Please wait a few minutes and try again.'),
+});
+
 /** Public PNR lookup: stops enumeration of booking references. */
 export const lookupLimiter = rateLimit({
   ...base,
