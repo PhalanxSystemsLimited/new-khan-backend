@@ -54,7 +54,7 @@ router.get('/search', searchLimiter, optionalAuth, validate({ query: searchSchem
             bs.id AS boarding_stop_id, bt.name AS boarding_terminal,
             ds.id AS dropping_stop_id, dt.name AS dropping_terminal,
             t.departure_at + make_interval(mins => bs.minutes_from_origin + t.delay_minutes) AS boarding_at,
-            t.departure_at + make_interval(mins => ds.minutes_from_origin + t.delay_minutes) AS dropping_at,
+            t.departure_at + make_interval(mins => ds.minutes_from_origin - ds.stay_minutes + t.delay_minutes) AS dropping_at,
             t.status, t.delay_minutes, f.amount AS fare, f.currency,
             seats.bookable - seats.taken AS seats_available,
             lv.terminal_name AS last_left, lv.generated_at AS last_left_at

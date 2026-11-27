@@ -163,12 +163,14 @@ CREATE TABLE route_stops (
     route_id              INT NOT NULL REFERENCES routes(id) ON DELETE CASCADE,
     terminal_id           INT NOT NULL REFERENCES terminals(id),
     stop_order            SMALLINT NOT NULL CHECK (stop_order > 0),
-    minutes_from_origin   INT NOT NULL DEFAULT 0 CHECK (minutes_from_origin >= 0),
+    minutes_from_origin   INT NOT NULL DEFAULT 0 CHECK (minutes_from_origin >= 0), -- when the bus LEAVES this stop
+    stay_minutes          SMALLINT NOT NULL DEFAULT 0,                             -- it arrives this much earlier
     km_from_origin        NUMERIC(7,2) NOT NULL DEFAULT 0,
     is_boarding_point     BOOLEAN NOT NULL DEFAULT TRUE,
     is_dropping_point     BOOLEAN NOT NULL DEFAULT TRUE,
     CONSTRAINT route_stops_order_uq    UNIQUE (route_id, stop_order),
-    CONSTRAINT route_stops_terminal_uq UNIQUE (route_id, terminal_id)
+    CONSTRAINT route_stops_terminal_uq UNIQUE (route_id, terminal_id),
+    CONSTRAINT route_stops_stay_valid  CHECK (stay_minutes >= 0 AND stay_minutes <= minutes_from_origin)
 );
 
 -- ---------------------------------------------------------------------

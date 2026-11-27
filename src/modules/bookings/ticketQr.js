@@ -86,7 +86,7 @@ export async function checkTicket(token, user, client) {
             b.registration_no, b.fleet_no,
             bt.name AS boarding_terminal, dt.name AS dropping_terminal,
             t.departure_at + make_interval(mins => bs.minutes_from_origin) AS boarding_at,
-            t.departure_at + make_interval(mins => ds.minutes_from_origin) AS dropping_at
+            t.departure_at + make_interval(mins => ds.minutes_from_origin - ds.stay_minutes) AS dropping_at
      FROM bookings bk
      JOIN trips t        ON t.id = bk.trip_id
      JOIN routes r       ON r.id = t.route_id

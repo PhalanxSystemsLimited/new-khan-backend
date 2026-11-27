@@ -556,7 +556,7 @@ Access: **public**, **C** = any signed-in user, **owner** = the booking's custom
 | GET | `/cities` · `/terminals?cityId=` | public | Locations |
 | POST/PATCH | `/cities[/:id]` · `/terminals[/:id]` | A | Manage locations |
 | GET | `/routes` · `/routes/:id` | public | Routes and stops |
-| POST/PATCH/PUT | `/routes` · `/routes/:id` · `/routes/:id/stops` | A | Manage routes. Replacing the stops deletes the route's fares (they belong to the old stops): without `deleteFares: true` the request is refused with **409 `FARES_WOULD_BE_DELETED`** and the count, so the admin is asked first |
+| POST/PATCH/PUT | `/routes` · `/routes/:id` · `/routes/:id/stops` | A | Manage routes. Each stop: `minutesFromOrigin` = when the bus **leaves** it (boarding time), `stayMinutes` = how long it waits there (it arrives that much earlier: dropping time); no stay at the first and last stops. `POST /routes` may take `schedules: { times: ["06:30","07:15"], busClass, defaultBusId?, daysOfWeek?, effectiveFrom? }`, made with the route (both or neither). `PUT …/stops` with the **same terminals in the same order** updates them in place: fares kept, allowed after bookings; if booked tickets would show new times it is refused with **409 `TIMES_CHANGE_BOOKED`** and the count until `confirmTimesChange: true`. Any other change replaces the stops: refused once bookings exist, and it deletes the route's fares, so without `deleteFares: true` it is refused with **409 `FARES_WOULD_BE_DELETED`** and the count |
 | GET/POST/PATCH | `/fleet/layouts` · `/fleet/buses` · `/fleet/drivers` | S read · A write | Fleet |
 | GET | `/fares?routeId=` | public | Fare table |
 | POST/PATCH | `/fares[/:id]` | A | Manage fares |

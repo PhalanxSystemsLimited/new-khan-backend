@@ -53,7 +53,7 @@ export async function arrivalsView(client, { terminalId }) {
     `SELECT ${COLS}, l.id AS list_id, l.list_no, COALESCE(l.bus_no, b.registration_no) AS bus, r.name AS route_name,
             lc.name AS list_city, t.status::text AS trip_status,
             t.departure_at + make_interval(mins => bs.minutes_from_origin + t.delay_minutes) AS left_at,
-            t.departure_at + make_interval(mins => ds.minutes_from_origin + t.delay_minutes) AS due_at
+            t.departure_at + make_interval(mins => ds.minutes_from_origin - ds.stay_minutes + t.delay_minutes) AS due_at
      FROM parcels p
      JOIN terminals ft ON ft.id = p.from_terminal_id JOIN cities fc ON fc.id = ft.city_id
      JOIN cargo_lists l ON l.id = p.list_id

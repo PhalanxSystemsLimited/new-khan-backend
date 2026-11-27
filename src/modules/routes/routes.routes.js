@@ -7,7 +7,7 @@ import { AppError } from '../../utils/AppError.js';
 import { buildUpdate } from '../../utils/sql.js';
 import { audit } from '../../utils/audit.js';
 import { assertUnused } from '../../utils/safeDelete.js';
-import { idParam, intId, text } from '../../utils/schemas.js';
+import { busClass, idParam, intId, isoDate, text, time } from '../../utils/schemas.js';
 
 const router = Router();
 const admin = [requireAuth, requireRole(...ADMIN_ROLES)];
@@ -25,7 +25,7 @@ export async function getRouteWithStops(id, client) {
   if (!route) return null;
   const { rows: stops } = await query(
     `SELECT rs.id, rs.terminal_id, t.name AS terminal_name, c.name AS city_name, rs.stop_order,
-            rs.minutes_from_origin, rs.km_from_origin, rs.is_boarding_point, rs.is_dropping_point
+            rs.minutes_from_origin, rs.stay_minutes, rs.km_from_origin, rs.is_boarding_point, rs.is_dropping_point
      FROM route_stops rs
      JOIN terminals t ON t.id = rs.terminal_id
      JOIN cities c ON c.id = t.city_id
@@ -54,10 +54,13 @@ router.get('/:id', validate({ params: idParam }), async (req, res) => {
   res.json({ data: route });
 });
 
+// minutesFromOrigin: when the bus LEAVES the stop (boarding). stayMinutes: how long it waits there, so it arrives
+// stayMinutes earlier (dropping). The first and last stops have no stay.
 const stopSchema = z
   .object({
     terminalId: intId,
     minutesFromOrigin: z.number().int().min(0).max(5000),
+    stayMinutes: z.number().int().min(0).max(600).default(0),
     kmFromOrigin: z.number().min(0).max(5000).default(0),
     isBoardingPoint: z.boolean().default(true),
     isDroppingPoint: z.boolean().default(true),
@@ -72,9 +75,13 @@ const stopsArray = z
     const ids = new Set(stops.map((s) => s.terminalId));
     if (ids.size !== stops.length) ctx.addIssue({ code: 'custom', message: 'A terminal can appear only once per route' });
     if (stops[0].minutesFromOrigin !== 0) ctx.addIssue({ code: 'custom', message: 'First stop must have minutesFromOrigin = 0' });
+    if (stops[0].stayMinutes || stops[stops.length - 1].stayMinutes) {
+      ctx.addIssue({ code: 'custom', message: 'The first and last stops have no stay time' });
+    }
     for (let i = 1; i < stops.length; i++) {
-      if (stops[i].minutesFromOrigin <= stops[i - 1].minutesFromOrigin) {
-        ctx.addIssue({ code: 'custom', message: 'Stops must be in travel order with increasing minutesFromOrigin' });
+      // It must arrive after it left the stop before: a travel time of at least one minute.
+      if (stops[i].minutesFromOrigin - stops[i].stayMinutes <= stops[i - 1].minutesFromOrigin) {
+        ctx.addIssue({ code: 'custom', message: `Stop ${i + 1}: the travel time from the stop before must be more than 0` });
         break;
       }
     }
@@ -84,13 +91,24 @@ async function replaceStops(client, routeId, stops) {
   await client.query(`DELETE FROM route_stops WHERE route_id = $1`, [routeId]);
   for (const [i, s] of stops.entries()) {
     await client.query(
-      `INSERT INTO route_stops (route_id, terminal_id, stop_order, minutes_from_origin, km_from_origin,
+      `INSERT INTO route_stops (route_id, terminal_id, stop_order, minutes_from_origin, stay_minutes, km_from_origin,
                                 is_boarding_point, is_dropping_point)
-       VALUES ($1, $2, $3, $4, $5, $6, $7)`,
-      [routeId, s.terminalId, i + 1, s.minutesFromOrigin, s.kmFromOrigin, s.isBoardingPoint, s.isDroppingPoint],
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
+      [routeId, s.terminalId, i + 1, s.minutesFromOrigin, s.stayMinutes, s.kmFromOrigin, s.isBoardingPoint, s.isDroppingPoint],
     );
   }
 }
+
+// Departure times made into schedules together with a new route (the "Also create schedules" part of the form).
+const routeSchedulesSchema = z
+  .object({
+    times: z.array(time).min(1).max(24).transform((t) => [...new Set(t)].sort()),
+    busClass,
+    defaultBusId: intId.nullable().optional(),
+    daysOfWeek: z.array(z.number().int().min(1).max(7)).min(1).max(7).transform((d) => [...new Set(d)].sort()).optional(),
+    effectiveFrom: isoDate.optional(),
+  })
+  .strict();
 
 const routeSchema = z
   .object({
@@ -98,13 +116,16 @@ const routeSchema = z
     name: text(3, 150),
     distanceKm: z.number().positive().max(5000).optional(),
     stops: stopsArray,
+    schedules: routeSchedulesSchema.optional(),
   })
   .strict();
 
 router.post('/', ...admin, validate({ body: routeSchema }), async (req, res) => {
   const b = req.valid.body;
   const last = b.stops[b.stops.length - 1];
-  const route = await withTransaction(async (client) => {
+  const { route, schedules } = await withTransaction(async (client) => {
+    const taken = await one(`SELECT id FROM routes WHERE code = $1`, [b.code], client);
+    if (taken) throw AppError.conflict(`Route code ${b.code} is already used. Choose another code.`);
     const r = await one(
       `INSERT INTO routes (code, name, origin_terminal_id, destination_terminal_id, distance_km, est_duration_minutes)
        VALUES ($1, $2, $3, $4, $5, $6) RETURNING id`,
@@ -112,10 +133,27 @@ router.post('/', ...admin, validate({ body: routeSchema }), async (req, res) => 
       client,
     );
     await replaceStops(client, r.id, b.stops);
-    return getRouteWithStops(r.id, client);
+    // The route and its schedules are made together: both or neither.
+    const made = [];
+    for (const t of b.schedules?.times ?? []) {
+      const s = b.schedules;
+      made.push(
+        await one(
+          `INSERT INTO schedules (route_id, departure_time, bus_class, default_bus_id, days_of_week, effective_from)
+           VALUES ($1, $2, $3, $4, COALESCE($5::smallint[], '{1,2,3,4,5,6,7}'), COALESCE($6::date, CURRENT_DATE))
+           RETURNING *`,
+          [r.id, t, s.busClass, s.defaultBusId ?? null, s.daysOfWeek ?? null, s.effectiveFrom ?? null],
+          client,
+        ),
+      );
+    }
+    return { route: await getRouteWithStops(r.id, client), schedules: made };
   });
   await audit({ req, action: 'route.create', entityType: 'route', entityId: route.id, newData: b });
-  res.status(201).json({ data: route });
+  for (const s of schedules) {
+    await audit({ req, action: 'schedule.create', entityType: 'schedule', entityId: s.id, newData: { ...s, madeWithRoute: route.code } });
+  }
+  res.status(201).json({ data: route, schedules });
 });
 
 router.patch(
@@ -167,14 +205,66 @@ router.delete('/:id', ...admin, validate({ params: idParam }), async (req, res) 
 router.put(
   '/:id/stops',
   ...admin,
-  validate({ params: idParam, body: z.object({ stops: stopsArray, deleteFares: z.boolean().optional() }).strict() }),
+  validate({
+    params: idParam,
+    body: z.object({ stops: stopsArray, deleteFares: z.boolean().optional(), confirmTimesChange: z.boolean().optional() }).strict(),
+  }),
   async (req, res) => {
     const { id } = req.valid.params;
-    const { stops, deleteFares } = req.valid.body;
+    const { stops, deleteFares, confirmTimesChange } = req.valid.body;
     let faresDeleted = 0;
+    let timesOnly = null; // set when only times, stays, km or Boards/Drops changed: the stops are updated in place
     const route = await withTransaction(async (client) => {
       const exists = await one(`SELECT id FROM routes WHERE id = $1 FOR UPDATE`, [id], client);
       if (!exists) throw AppError.notFound('Route not found');
+      const { rows: old } = await query(
+        `SELECT id, terminal_id, minutes_from_origin, stay_minutes, km_from_origin, is_boarding_point, is_dropping_point
+         FROM route_stops WHERE route_id = $1 ORDER BY stop_order FOR UPDATE`,
+        [id],
+        client,
+      );
+      // Same terminals in the same order: update the stops in place. Their fares and bookings stay with them,
+      // so this is allowed after bookings exist (booked tickets then show the new times).
+      if (old.length === stops.length && old.every((o, i) => o.terminalId === stops[i].terminalId)) {
+        const retimed = old.some((o, i) => o.minutesFromOrigin !== stops[i].minutesFromOrigin || o.stayMinutes !== stops[i].stayMinutes);
+        const booked = retimed
+          ? (await one(
+              `SELECT count(*)::int AS n FROM bookings b JOIN trips t ON t.id = b.trip_id
+               WHERE t.route_id = $1 AND t.status IN ('scheduled', 'delayed', 'boarding')
+                 AND b.status IN ('pending', 'confirmed')`,
+              [id],
+              client,
+            )).n
+          : 0;
+        if (booked && !confirmTimesChange) {
+          throw new AppError(
+            409,
+            `${booked} booking${booked === 1 ? '' : 's'} on this route's coming trips will show the new times on their tickets. Tell those passengers if a time moves earlier.`,
+            'TIMES_CHANGE_BOOKED',
+            { bookings: booked },
+          );
+        }
+        for (const [i, s] of stops.entries()) {
+          await client.query(
+            `UPDATE route_stops SET minutes_from_origin = $2, stay_minutes = $3, km_from_origin = $4,
+                    is_boarding_point = $5, is_dropping_point = $6
+             WHERE id = $1`,
+            [old[i].id, s.minutesFromOrigin, s.stayMinutes, s.kmFromOrigin, s.isBoardingPoint, s.isDroppingPoint],
+          );
+        }
+        const duration = stops[stops.length - 1].minutesFromOrigin;
+        await client.query(`UPDATE routes SET est_duration_minutes = $2 WHERE id = $1`, [id, duration]);
+        // Trips not yet gone arrive at the new time (used when checking a bus is free).
+        const moved = await query(
+          `UPDATE trips SET arrival_at = departure_at + make_interval(mins => $2)
+           WHERE route_id = $1 AND status IN ('scheduled', 'delayed', 'boarding')
+             AND arrival_at IS DISTINCT FROM departure_at + make_interval(mins => $2)`,
+          [id, duration],
+          client,
+        );
+        timesOnly = { old, bookingsShowingNewTimes: booked, tripsRetimed: moved.rowCount ?? 0 };
+        return getRouteWithStops(id, client);
+      }
       const used = await one(
         `SELECT EXISTS (SELECT 1 FROM bookings b JOIN route_stops rs ON rs.id = b.boarding_stop_id WHERE rs.route_id = $1) AS used`,
         [id],
@@ -197,8 +287,13 @@ router.put(
       );
       return getRouteWithStops(id, client);
     });
-    await audit({ req, action: 'route.stops_replace', entityType: 'route', entityId: id, newData: { stops, faresDeleted } });
-    res.json({ data: route });
+    if (timesOnly) {
+      const { old, ...counts } = timesOnly;
+      await audit({ req, action: 'route.stops_update', entityType: 'route', entityId: id, oldData: { stops: old }, newData: { stops, ...counts } });
+    } else {
+      await audit({ req, action: 'route.stops_replace', entityType: 'route', entityId: id, newData: { stops, faresDeleted } });
+    }
+    res.json({ data: route, inPlace: Boolean(timesOnly) });
   },
 );
 
