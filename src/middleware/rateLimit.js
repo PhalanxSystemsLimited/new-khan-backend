@@ -21,13 +21,58 @@ const base = {
 /** Key by authenticated user when available, otherwise by IP. */
 const userOrIp = (req) => (req.user ? `u:${req.user.id}` : `ip:${req.ip}`);
 
-/** Applies to every request. */
+/** The request carries a sign-in token (checked later, in requireAuth / optionalAuth). */
+const hasToken = (req) => typeof req.headers.authorization === 'string' && req.headers.authorization.startsWith('Bearer ');
+
+/**
+ * Applies to every request, per internet address. Visitors who are not signed in: 300 per 15 minutes.
+ * Requests with a sign-in token are counted separately and get a much higher ceiling, because the staff of a
+ * terminal (counter PCs, cargo desk, manager) usually share one office connection. Each signed-in person is also
+ * limited on their own (accountLimiter), and made-up tokens are stopped by badTokenLimiter.
+ */
 export const globalLimiter = rateLimit({
   ...base,
   windowMs: 15 * 60 * 1000,
-  limit: 300,
+  limit: (req) => (hasToken(req) ? 3000 : 300),
+  keyGenerator: (req) => `${hasToken(req) ? 'signed-in' : 'visitor'}:${req.ip}`,
   message: message('Too many requests, please try again later.'),
 });
+
+/**
+ * Sign-in tokens that turn out to be invalid, per internet address: 30 per 15 minutes. Only refused tokens count
+ * (answers other than 401 are not counted), so a token that expires now and then never gets near it.
+ */
+export const badTokenLimiter = rateLimit({
+  ...base,
+  windowMs: 15 * 60 * 1000,
+  limit: 30,
+  skip: (req) => !hasToken(req),
+  skipSuccessfulRequests: true,
+  requestWasSuccessful: (_req, res) => res.statusCode !== 401,
+  message: message('Too many requests with an invalid sign-in. Sign in again, or wait 15 minutes.'),
+});
+
+/**
+ * Each signed-in person: 900 requests per 15 minutes (about one a second), whatever connection they use. A busy
+ * counter clerk uses a fraction of it; one account that runs wild is stopped without stopping their colleagues.
+ * Used by requireAuth / optionalAuth once the person is known (countAccount below).
+ */
+const accountLimiter = rateLimit({
+  ...base,
+  windowMs: 15 * 60 * 1000,
+  limit: 900,
+  keyGenerator: (req) => `u:${req.user.id}`,
+  handler: (_req, res, _next, options) => res.status(options.statusCode).json(
+    message('Too many requests from this account. Wait a minute, then try again.'),
+  ),
+});
+
+/** Counts the request against its signed-in person once (a request can pass through requireAuth more than once). */
+export function countAccount(req, res, next) {
+  if (!req.user || req.accountCounted) return next();
+  req.accountCounted = true;
+  return accountLimiter(req, res, next);
+}
 
 /** Login / signup / refresh: brute-force protection. */
 export const authLimiter = rateLimit({

@@ -7,7 +7,7 @@ import pinoHttp from 'pino-http';
 import { env } from './config/env.js';
 import { pool } from './config/db.js';
 import { logger } from './utils/logger.js';
-import { globalLimiter } from './middleware/rateLimit.js';
+import { badTokenLimiter, globalLimiter } from './middleware/rateLimit.js';
 import { AppError } from './utils/AppError.js';
 import { errorHandler, notFoundHandler } from './middleware/errorHandler.js';
 
@@ -120,7 +120,7 @@ export function createApp() {
     paymentWebhook,
   );
 
-  app.use(globalLimiter);
+  app.use(globalLimiter, badTokenLimiter);
   // Website content saved from the admin panel (policy texts in two languages) is larger than any other request.
   const jsonSmall = express.json({ limit: '50kb', strict: true });
   const jsonContent = express.json({ limit: '1mb', strict: true });

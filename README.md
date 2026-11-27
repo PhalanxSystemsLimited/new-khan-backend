@@ -622,7 +622,7 @@ Quote the `requestId` (also in the `X-Request-Id` response header) when searchin
 - **Validation:** every body, query and path param is checked with Zod; unknown fields are rejected, so clients can't send `role`, prices, etc.
 - **Prices are server-side:** fares, discounts and payment amounts always come from the DB.
 - **Auth:** tokens are verified with Supabase on every request; roles come from the DB.
-- **Rate limits** (per IP, or per user when signed in): global 300 / 15 min (heavy admin use from one office IP can reach it; raise `limit` in `rateLimit.js` if staff see "Too many requests"); login 10 / 15 min; OTP 5 / hour;
+- **Rate limits** (`middleware/rateLimit.js`): every request, per IP: **300 / 15 min for visitors** (no sign-in token), **3,000 / 15 min for requests with a token** (counted separately: a terminal's staff share one office connection); **each signed-in person 900 / 15 min** on any connection (`countAccount`, run by requireAuth / optionalAuth); **invalid tokens 30 / 15 min per IP**, then that IP's token requests are refused (stops made-up tokens claiming the higher ceiling). All answer 429 `RATE_LIMITED`; the admin panel then says "Too many requests… Your account is fine" and keeps an open screen open. Staff screens do not refresh while their tab is hidden. Login 10 / 15 min; OTP 5 / hour;
   booking 20 / hour; PNR/phone lookup 20 / 15 min; payment 30 / 15 min; search 60 / min.
 - **Payments:** idempotency keys, signed webhooks with constant-time comparison, amounts checked against the booking,
   return URLs verified with Safepay's API, duplicate/late payments refunded.

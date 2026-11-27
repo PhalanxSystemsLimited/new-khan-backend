@@ -2,6 +2,7 @@ import { createHash } from 'node:crypto';
 import { supabaseAdmin } from '../config/supabase.js';
 import { one } from '../config/db.js';
 import { AppError } from '../utils/AppError.js';
+import { countAccount } from './rateLimit.js';
 
 /*
  * Roles (see README §6.5):
@@ -121,17 +122,17 @@ async function resolveUser(req) {
   return profile;
 }
 
-export async function requireAuth(req, _res, next) {
+export async function requireAuth(req, res, next) {
   const user = await resolveUser(req);
   if (!user) throw AppError.unauthorized();
   req.user = user;
-  next();
+  countAccount(req, res, next); // each signed-in person's own request limit (rateLimit.js)
 }
 
 /** Attaches req.user if a valid token is present; otherwise continues as guest. */
-export async function optionalAuth(req, _res, next) {
+export async function optionalAuth(req, res, next) {
   if (req.headers.authorization) req.user = await resolveUser(req);
-  next();
+  countAccount(req, res, next);
 }
 
 export function requireRole(...roles) {
