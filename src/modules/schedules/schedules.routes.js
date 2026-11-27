@@ -8,6 +8,7 @@ import { buildUpdate } from '../../utils/sql.js';
 import { audit } from '../../utils/audit.js';
 import { busClass, idParam, intId, isoDate, time } from '../../utils/schemas.js';
 import { busConfirmReady } from '../trips/busConfirm.js';
+import { assertUnused } from '../../utils/safeDelete.js';
 import { customRouteSchema, findOrCreateRoute } from '../routes/customRoute.js';
 
 const router = Router();
@@ -97,6 +98,27 @@ router.patch(
     res.json({ data: s });
   },
 );
+
+/**
+ * Delete a schedule. Trips already created from it stay as they are (bookings may be on them): they are cancelled on
+ * the Trips page if needed. The reply says how many upcoming ones there are.
+ */
+router.delete('/:id', ...admin, validate({ params: idParam }), async (req, res) => {
+  const futureTripsKept = await withTransaction(async (client) => {
+    const s = await one(`SELECT * FROM schedules WHERE id = $1 FOR UPDATE`, [req.valid.params.id], client);
+    if (!s) throw AppError.notFound('Schedule not found');
+    await assertUnused(client, 'schedules', s.id, { what: 'This schedule', skip: ['trips'] });
+    const { n } = await one(
+      `SELECT count(*)::int AS n FROM trips WHERE schedule_id = $1 AND departure_at > now() AND status IN ('scheduled', 'delayed', 'boarding')`,
+      [s.id],
+      client,
+    );
+    await client.query(`DELETE FROM schedules WHERE id = $1`, [s.id]);
+    await audit({ req, client, action: 'schedule.delete', entityType: 'schedule', entityId: s.id, oldData: s, newData: { futureTripsKept: n } });
+    return n;
+  });
+  res.json({ data: { futureTripsKept } });
+});
 
 /**
  * Create dated trips from a schedule for a date range (max 92 days).

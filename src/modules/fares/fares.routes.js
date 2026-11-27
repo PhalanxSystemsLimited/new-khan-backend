@@ -81,4 +81,12 @@ router.patch(
   },
 );
 
+/** A fare can always be deleted: bookings keep the amount they were sold at. */
+router.delete('/:id', ...admin, validate({ params: idParam }), async (req, res) => {
+  const old = await one(`DELETE FROM fares WHERE id = $1 RETURNING *`, [req.valid.params.id]);
+  if (!old) throw AppError.notFound('Fare not found');
+  await audit({ req, action: 'fare.delete', entityType: 'fare', entityId: old.id, oldData: old });
+  res.status(204).end();
+});
+
 export default router;

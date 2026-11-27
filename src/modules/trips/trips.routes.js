@@ -14,6 +14,7 @@ import { expireStaleSoon } from '../../jobs/expireBookings.js';
 import { searchLimiter } from '../../middleware/rateLimit.js';
 import { AppError } from '../../utils/AppError.js';
 import { audit } from '../../utils/audit.js';
+import { assertUnused } from '../../utils/safeDelete.js';
 import { bigIdParam, busClass, intId, isoDate, isoDateTime, longText, personName } from '../../utils/schemas.js';
 import { seatOrder } from '../../utils/seats.js';
 
@@ -602,6 +603,21 @@ router.patch(
     res.json({ data: result.trip, affectedBookings: result.affectedBookings, autoReport: result.autoReport });
   },
 );
+
+/**
+ * Delete a trip made by mistake: only while it has no bookings (not even expired holds), vouchers, cargo lists or
+ * load slips and is in no report. Otherwise it is cancelled with Status, which keeps its money and history.
+ */
+router.delete('/:id', ...admin, validate({ params: bigIdParam }), async (req, res) => {
+  await withTransaction(async (client) => {
+    const t = await one(`SELECT * FROM trips WHERE id = $1 FOR UPDATE`, [req.valid.params.id], client);
+    if (!t) throw AppError.notFound('Trip not found');
+    await assertUnused(client, 'trips', t.id, { what: 'This trip', instead: 'Cancel it with Status… instead: that keeps its bookings, refunds and vouchers.' });
+    await client.query(`DELETE FROM trips WHERE id = $1`, [t.id]);
+    await audit({ req, client, action: 'trip.delete', entityType: 'trip', entityId: t.id, oldData: t });
+  });
+  res.status(204).end();
+});
 
 /** Passenger manifest for boarding staff. */
 router.get('/:id/manifest', ...staff, validate({ params: bigIdParam }), async (req, res) => {

@@ -1,10 +1,12 @@
 import { Router } from 'express';
 import { z } from 'zod';
-import { query, one } from '../../config/db.js';
+import { query, one, withTransaction } from '../../config/db.js';
 import { validate } from '../../middleware/validate.js';
 import { requireAuth, requireRole, ADMIN_ROLES } from '../../middleware/auth.js';
 import { AppError } from '../../utils/AppError.js';
 import { buildUpdate } from '../../utils/sql.js';
+import { audit } from '../../utils/audit.js';
+import { assertUnused } from '../../utils/safeDelete.js';
 import { idParam, intId, phone, text, longText } from '../../utils/schemas.js';
 
 const router = Router();
@@ -46,6 +48,18 @@ router.patch('/cities/:id', ...admin, validate({ params: idParam, body: citySche
   const city = await one(`UPDATE cities SET ${setSql} WHERE id = $1 RETURNING *`, [req.valid.params.id, ...values]);
   if (!city) throw AppError.notFound('City not found');
   res.json({ data: city });
+});
+
+/** Only a city with no terminals and no cargo rates (one added by mistake). Otherwise: untick Active. */
+router.delete('/cities/:id', ...admin, validate({ params: idParam }), async (req, res) => {
+  await withTransaction(async (client) => {
+    const city = await one(`SELECT * FROM cities WHERE id = $1 FOR UPDATE`, [req.valid.params.id], client);
+    if (!city) throw AppError.notFound('City not found');
+    await assertUnused(client, 'cities', city.id, { what: `City ${city.name}`, instead: 'Untick "Active" in Edit to hide it from the booking search instead.' });
+    await client.query(`DELETE FROM cities WHERE id = $1`, [city.id]);
+    await audit({ req, client, action: 'city.delete', entityType: 'city', entityId: city.id, oldData: city });
+  });
+  res.status(204).end();
 });
 
 // ---------------- Terminals ----------------
@@ -113,5 +127,17 @@ router.patch(
     res.json({ data: t });
   },
 );
+
+/** Only a terminal on no route, parcel, voucher or staff account (one added by mistake). Otherwise: untick Active. */
+router.delete('/terminals/:id', ...admin, validate({ params: idParam }), async (req, res) => {
+  await withTransaction(async (client) => {
+    const t = await one(`SELECT * FROM terminals WHERE id = $1 FOR UPDATE`, [req.valid.params.id], client);
+    if (!t) throw AppError.notFound('Terminal not found');
+    await assertUnused(client, 'terminals', t.id, { what: `Terminal ${t.name}`, instead: 'Untick "Active" in Edit to stop using it instead.' });
+    await client.query(`DELETE FROM terminals WHERE id = $1`, [t.id]);
+    await audit({ req, client, action: 'terminal.delete', entityType: 'terminal', entityId: t.id, oldData: t });
+  });
+  res.status(204).end();
+});
 
 export default router;

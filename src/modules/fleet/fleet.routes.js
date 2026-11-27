@@ -6,6 +6,7 @@ import { requireAuth, requireRole, ADMIN_ROLES, STAFF_ROLES } from '../../middle
 import { AppError } from '../../utils/AppError.js';
 import { audit } from '../../utils/audit.js';
 import { buildUpdate } from '../../utils/sql.js';
+import { assertUnused } from '../../utils/safeDelete.js';
 import { busClass, cnic, idParam, intId, isoDate, personName, phone, text } from '../../utils/schemas.js';
 
 const router = Router();
@@ -174,6 +175,22 @@ router.patch('/buses/:id', ...admin, validate({ params: idParam, body: busSchema
   res.json({ data: bus });
 });
 
+/** Only a bus that never ran a trip or sat on a schedule (one added by mistake). Otherwise: untick Active. */
+router.delete('/buses/:id', ...admin, validate({ params: idParam }), async (req, res) => {
+  await withTransaction(async (client) => {
+    const bus = await one(`SELECT * FROM buses WHERE id = $1 FOR UPDATE`, [req.valid.params.id], client);
+    if (!bus) throw AppError.notFound('Bus not found');
+    await assertUnused(client, 'buses', bus.id, { what: `Bus ${bus.registrationNo}`, instead: 'Untick "Active" in Edit to take it out of service instead.' });
+    await client.query(`DELETE FROM buses WHERE id = $1`, [bus.id]);
+    await audit({ req, client, action: 'bus.delete', entityType: 'bus', entityId: bus.id, oldData: bus });
+  });
+  res.status(204).end();
+});
+
+/** A driver or conductor that comes from an employee record is removed with the employee (Employees page). */
+const fromEmployee = (kind) =>
+  AppError.conflict(`This ${kind} comes from an employee record. Delete the employee, or mark them as left, on the Employees page.`);
+
 // ======================= Drivers =======================
 const driverSchema = z
   .object({
@@ -217,6 +234,18 @@ router.patch('/drivers/:id', ...admin, validate({ params: idParam, body: driverS
   const driver = await one(`UPDATE drivers SET ${setSql} WHERE id = $1 RETURNING *`, [req.valid.params.id, ...values]);
   if (!driver) throw AppError.notFound('Driver not found');
   res.json({ data: driver });
+});
+
+router.delete('/drivers/:id', ...admin, validate({ params: idParam }), async (req, res) => {
+  await withTransaction(async (client) => {
+    const d = await one(`SELECT * FROM drivers WHERE id = $1 FOR UPDATE`, [req.valid.params.id], client);
+    if (!d) throw AppError.notFound('Driver not found');
+    if (d.employeeId) throw fromEmployee('driver');
+    await assertUnused(client, 'drivers', d.id, { what: `Driver ${d.fullName}`, instead: 'Untick "Active" in Edit instead.' });
+    await client.query(`DELETE FROM drivers WHERE id = $1`, [d.id]);
+    await audit({ req, client, action: 'driver.delete', entityType: 'driver', entityId: d.id, oldData: d });
+  });
+  res.status(204).end();
 });
 
 // ======================= Conductors (with an optional login account) =======================
@@ -271,6 +300,18 @@ router.patch('/conductors/:id', ...admin, validate({ params: idParam, body: cond
   const row = await one(`UPDATE conductors SET ${setSql} WHERE id = $1 RETURNING *`, [req.valid.params.id, ...values]).catch(uniqueConductor);
   await audit({ req, action: 'conductor.update', entityType: 'conductor', entityId: row.id, oldData: before, newData: req.valid.body });
   res.json({ data: row });
+});
+
+router.delete('/conductors/:id', ...admin, validate({ params: idParam }), async (req, res) => {
+  await withTransaction(async (client) => {
+    const c = await one(`SELECT * FROM conductors WHERE id = $1 FOR UPDATE`, [req.valid.params.id], client);
+    if (!c) throw AppError.notFound('Conductor not found');
+    if (c.employeeId) throw fromEmployee('conductor');
+    await assertUnused(client, 'conductors', c.id, { what: `Conductor ${c.fullName}`, instead: 'Untick "Active" in Edit instead.' });
+    await client.query(`DELETE FROM conductors WHERE id = $1`, [c.id]);
+    await audit({ req, client, action: 'conductor.delete', entityType: 'conductor', entityId: c.id, oldData: c });
+  });
+  res.status(204).end();
 });
 
 // ======================= Staff directory (people who work but do not sign in) =======================

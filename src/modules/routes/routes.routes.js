@@ -6,6 +6,7 @@ import { requireAuth, requireRole, ADMIN_ROLES } from '../../middleware/auth.js'
 import { AppError } from '../../utils/AppError.js';
 import { buildUpdate } from '../../utils/sql.js';
 import { audit } from '../../utils/audit.js';
+import { assertUnused } from '../../utils/safeDelete.js';
 import { idParam, intId, text } from '../../utils/schemas.js';
 
 const router = Router();
@@ -139,14 +140,38 @@ router.patch(
   },
 );
 
-/** Replace the full stop list. Blocked once bookings or fares reference the stops. */
+/**
+ * Delete a route nothing uses yet: no trips, schedules, promo codes or report settings. Its own stops and fares go
+ * with it (the admin is told how many first). Otherwise: untick Active.
+ */
+router.delete('/:id', ...admin, validate({ params: idParam }), async (req, res) => {
+  const { id } = req.valid.params;
+  await withTransaction(async (client) => {
+    const r = await one(`SELECT * FROM routes WHERE id = $1 FOR UPDATE`, [id], client);
+    if (!r) throw AppError.notFound('Route not found');
+    const rules = { what: `Route ${r.code}`, instead: 'Untick "Active" in Edit to stop using it instead.' };
+    await assertUnused(client, 'routes', id, { ...rules, skip: ['route_stops', 'fares'] });
+    const { rows: stops } = await query(`SELECT * FROM route_stops WHERE route_id = $1 ORDER BY stop_order FOR UPDATE`, [id], client);
+    for (const s of stops) await assertUnused(client, 'route_stops', s.id, { ...rules, skip: ['fares'] });
+    const { rows: fares } = await query(`SELECT * FROM fares WHERE route_id = $1 ORDER BY id`, [id], client);
+    await client.query(`DELETE FROM routes WHERE id = $1`, [id]); // its stops and fares go with it
+    await audit({ req, client, action: 'route.delete', entityType: 'route', entityId: id, oldData: { ...r, stops, fares } });
+  });
+  res.status(204).end();
+});
+
+/**
+ * Replace the full stop list. Blocked once bookings use the stops. The route's fares belong to its old stops and are
+ * deleted with them: the request must say so (deleteFares), so the admin is warned with the count first.
+ */
 router.put(
   '/:id/stops',
   ...admin,
-  validate({ params: idParam, body: z.object({ stops: stopsArray }).strict() }),
+  validate({ params: idParam, body: z.object({ stops: stopsArray, deleteFares: z.boolean().optional() }).strict() }),
   async (req, res) => {
     const { id } = req.valid.params;
-    const { stops } = req.valid.body;
+    const { stops, deleteFares } = req.valid.body;
+    let faresDeleted = 0;
     const route = await withTransaction(async (client) => {
       const exists = await one(`SELECT id FROM routes WHERE id = $1 FOR UPDATE`, [id], client);
       if (!exists) throw AppError.notFound('Route not found');
@@ -156,6 +181,15 @@ router.put(
         client,
       );
       if (used.used) throw AppError.conflict('Stops cannot be replaced after bookings exist. Create a new route instead.');
+      faresDeleted = (await one(`SELECT count(*)::int AS n FROM fares WHERE route_id = $1`, [id], client)).n;
+      if (faresDeleted && !deleteFares) {
+        throw new AppError(
+          409,
+          `Saving these stops deletes this route's ${faresDeleted} fare${faresDeleted === 1 ? '' : 's'}: fares belong to the old stops. Set the fares again after saving.`,
+          'FARES_WOULD_BE_DELETED',
+          { fares: faresDeleted },
+        );
+      }
       await replaceStops(client, id, stops);
       await client.query(
         `UPDATE routes SET origin_terminal_id = $2, destination_terminal_id = $3, est_duration_minutes = $4 WHERE id = $1`,
@@ -163,7 +197,7 @@ router.put(
       );
       return getRouteWithStops(id, client);
     });
-    await audit({ req, action: 'route.stops_replace', entityType: 'route', entityId: id, newData: { stops } });
+    await audit({ req, action: 'route.stops_replace', entityType: 'route', entityId: id, newData: { stops, faresDeleted } });
     res.json({ data: route });
   },
 );

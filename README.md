@@ -556,7 +556,7 @@ Access: **public**, **C** = any signed-in user, **owner** = the booking's custom
 | GET | `/cities` · `/terminals?cityId=` | public | Locations |
 | POST/PATCH | `/cities[/:id]` · `/terminals[/:id]` | A | Manage locations |
 | GET | `/routes` · `/routes/:id` | public | Routes and stops |
-| POST/PATCH/PUT | `/routes` · `/routes/:id` · `/routes/:id/stops` | A | Manage routes |
+| POST/PATCH/PUT | `/routes` · `/routes/:id` · `/routes/:id/stops` | A | Manage routes. Replacing the stops deletes the route's fares (they belong to the old stops): without `deleteFares: true` the request is refused with **409 `FARES_WOULD_BE_DELETED`** and the count, so the admin is asked first |
 | GET/POST/PATCH | `/fleet/layouts` · `/fleet/buses` · `/fleet/drivers` | S read · A write | Fleet |
 | GET | `/fares?routeId=` | public | Fare table |
 | POST/PATCH | `/fares[/:id]` | A | Manage fares |
@@ -599,6 +599,7 @@ Access: **public**, **C** = any signed-in user, **owner** = the booking's custom
 | POST | `/payments/webhook/:gateway` | signed | Gateway callback (`safepay`) |
 | GET/POST | `/payments/safepay/return[/:lang]` | – | Safepay browser redirect (verified with Safepay's API) |
 | GET/POST/PATCH | `/admin/promo-codes` | A | Promo codes |
+| DELETE | `/fleet/buses/:id` · `/fleet/drivers/:id` · `/fleet/conductors/:id` · `/cities/:id` · `/terminals/:id` · `/routes/:id` · `/fares/:id` · `/schedules/:id` · `/trips/:id` · `/admin/promo-codes/:id` · `/cargo/rates/:id` · `/admin/employees/:id` | A | The admin panel's **Delete** buttons. Only a record nothing uses is deleted (`utils/safeDelete.js` reads the database's own foreign keys and counts the rows pointing at it); otherwise **409 `IN_USE`** names what uses it (e.g. "trips (44)") and what to do instead (untick Active, cancel the trip). Every delete is in the activity log with the deleted row. A route goes with its own stops and fares. A schedule's trips stay (`futureTripsKept` in the reply). Fares and cargo rates can always be deleted. A driver / conductor from an employee record is deleted with the employee; an employee with a login is refused |
 | GET/PUT | `/admin/cancellation-policies` | A | Refund rules (hours before departure → % refunded) |
 | GET/PATCH | `/admin/refunds[/:id]` | A | Process refunds |
 | GET | `/admin/reports/daily-revenue` · `/admin/reports/summary` · `/admin/audit-logs` | A | Reporting |

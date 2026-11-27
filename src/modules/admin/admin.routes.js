@@ -11,6 +11,7 @@ import {
 } from '../../utils/schemas.js';
 import { getRouteWithStops } from '../routes/routes.routes.js';
 import { markPaymentRefunded } from '../bookings/bookings.service.js';
+import { assertUnused } from '../../utils/safeDelete.js';
 
 const router = Router();
 /** Admins: everything here. Managers: only reading refunds and reports. */
@@ -131,6 +132,18 @@ router.patch(
     res.json({ data: promo });
   },
 );
+
+/** Only a code never used on a booking (not even a hold). Otherwise: untick Active. */
+router.delete('/promo-codes/:id', validate({ params: idParam }), async (req, res) => {
+  await withTransaction(async (client) => {
+    const p = await one(`SELECT * FROM promo_codes WHERE id = $1 FOR UPDATE`, [req.valid.params.id], client);
+    if (!p) throw AppError.notFound('Promo code not found');
+    await assertUnused(client, 'promo_codes', p.id, { what: `Code ${p.code}`, instead: 'Untick "Active" in Edit to stop it being used instead.' });
+    await client.query(`DELETE FROM promo_codes WHERE id = $1`, [p.id]);
+    await audit({ req, client, action: 'promo.delete', entityType: 'promo_code', entityId: p.id, oldData: p });
+  });
+  res.status(204).end();
+});
 
 // ======================= Cancellation policies =======================
 router.get('/cancellation-policies', async (_req, res) => {

@@ -139,6 +139,14 @@ cargoRouter.post('/rates', adminOnly, validate({ body: rateBody }), async (req, 
   res.status(201).json({ data: row });
 });
 
+/** A rate can always be deleted: parcels keep the price they were booked at. */
+cargoRouter.delete('/rates/:id', adminOnly, validate({ params: idParam }), async (req, res) => {
+  const old = await one(`DELETE FROM cargo_rates WHERE id = $1 RETURNING *`, [req.valid.params.id]);
+  if (!old) throw AppError.notFound('Rate not found');
+  await audit({ req, action: 'cargo_rate.delete', entityType: 'cargo_rate', entityId: old.id, oldData: old });
+  res.status(204).end();
+});
+
 cargoRouter.patch('/rates/:id', adminOnly, validate({ params: idParam, body: rateBody }), async (req, res) => {
   const b = req.valid.body;
   const old = await one(`SELECT * FROM cargo_rates WHERE id = $1`, [req.valid.params.id]);

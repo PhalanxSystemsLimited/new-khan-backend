@@ -19,6 +19,7 @@ import { validate } from '../../middleware/validate.js';
 import { requireAuth, requireRole, ADMIN_ROLES, STAFF_ROLES } from '../../middleware/auth.js';
 import { AppError } from '../../utils/AppError.js';
 import { audit } from '../../utils/audit.js';
+import { assertUnused } from '../../utils/safeDelete.js';
 import { cnic, intId, isoDate, longText, pagination, personName, phone, text, uuid } from '../../utils/schemas.js';
 
 // ---------------------------------------------------------------------------------------------------------------
@@ -329,6 +330,34 @@ adminEmployeesRouter.patch('/:id', validate({ params: idParam, body: updateSchem
     await audit({ req, client, action: 'employee.update', entityType: 'employee', entityId: before.employeeCode, oldData, newData: b });
   }).catch(unique);
   res.json({ data: await loadEmployee(id) });
+});
+
+/**
+ * Delete an employee registered by mistake: no sign-in account, and their driver / conductor record (if any) on no
+ * trip or report. That record goes with them. Otherwise: untick Active and set "Left on".
+ */
+adminEmployeesRouter.delete('/:id', validate({ params: idParam }), async (req, res) => {
+  const id = req.valid.params.id;
+  await withTransaction(async (client) => {
+    const e = await one(`SELECT * FROM employees WHERE id = $1 FOR UPDATE`, [id], client);
+    if (!e) throw AppError.notFound('Employee not found');
+    const rules = { what: `Employee ${e.employeeCode} (${e.fullName})`, instead: 'Untick "Active" and set "Left on" in Edit instead.' };
+    if (e.userId) throw AppError.conflict(`${rules.what} has a sign-in account. Remove it first (Login… then Remove login), then delete.`);
+    const { rows: crew } = await query(
+      `SELECT 'drivers' AS t, id FROM drivers WHERE employee_id = $1 UNION ALL SELECT 'conductors', id FROM conductors WHERE employee_id = $1`,
+      [id],
+      client,
+    );
+    for (const c of crew) {
+      await client.query(`SELECT 1 FROM ${c.t} WHERE id = $1 FOR UPDATE`, [c.id]); // c.t is one of the two names above
+      await assertUnused(client, c.t, c.id, rules);
+    }
+    await assertUnused(client, 'employees', id, { ...rules, skip: ['drivers', 'conductors'] });
+    for (const c of crew) await client.query(`DELETE FROM ${c.t} WHERE id = $1`, [c.id]);
+    await client.query(`DELETE FROM employees WHERE id = $1`, [id]);
+    await audit({ req, client, action: 'employee.delete', entityType: 'employee', entityId: e.employeeCode, oldData: e });
+  });
+  res.status(204).end();
 });
 
 /** Links (or unlinks) the employee's sign-in account and gives it a role. Manager and admin roles: super admins only. */
